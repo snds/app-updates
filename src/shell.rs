@@ -45,7 +45,7 @@ pub trait Host: Send + Sync + 'static {
     fn before_restart(&self, _handle: &AppHandle) {}
 
     /// Why checking is held right now, if it is (Lockdown's demo home), in the words after
-    /// "<App> didn't check for updates: ".
+    /// `"<App> didn't check for updates: "`.
     fn network_held(&self) -> Option<String> {
         None
     }
