@@ -13,8 +13,8 @@
 # 4. publishes the bundles, their `.sig` files and `latest.json` to the
 #    rolling pre-release `<app>-main` on snds/releases, never marked latest.
 #
-# Without TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD,
-# RELEASES_TOKEN or the app's `updater.pub`, or on anything but a push to the
+# Without TAURI_SIGNING_PRIVATE_KEY, RELEASES_TOKEN or the app's
+# `updater.pub`, or on anything but a push to the
 # default branch, it is a dry run: the same builds, signed with a throwaway
 # key made in the job, the would-be `latest.json` kept as a workflow
 # artifact, and a job summary that says why nothing was published. A dry run
@@ -80,7 +80,7 @@ on:
         description: "The app's updater private key (`tauri signer generate`)."
         required: false
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
-        description: "The password for that key."
+        description: "The password for that key. Leave it unset for a key made without one."
         required: false
       RELEASES_TOKEN:
         description: "A fine-grained token with Contents: write on snds/releases only."
@@ -128,7 +128,6 @@ jobs:
           REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           HAVE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
-          HAVE_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
           HAVE_TOKEN: ${{ secrets.RELEASES_TOKEN != '' }}
         run: |
           echo "$APP" | grep -Eqx '[a-z0-9][a-z0-9-]{0,62}' || { echo "::error::app '$APP' isn't an id (lower-case letters, digits and dashes)"; exit 1; }
@@ -168,7 +167,8 @@ jobs:
 
           missing=()
           [ "$HAVE_KEY" = true ] || missing+=("TAURI_SIGNING_PRIVATE_KEY")
-          [ "$HAVE_PASSWORD" = true ] || missing+=("TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
+          # The password is optional: a key made without one (Enter at the prompt) signs with
+          # an empty password, and requiring the secret made such keys impossible to use.
           [ "$HAVE_TOKEN" = true ] || missing+=("RELEASES_TOKEN")
           reasons=()
           for s in "${missing[@]}"; do reasons+=("the secret \`$s\` isn't set"); done

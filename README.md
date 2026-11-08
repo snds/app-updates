@@ -151,13 +151,16 @@ of a download. Updates are protected by the updater's own signature, not by Appl
 ### What to set up once per app
 
 1. **Make the key pair.** In the app's folder: `npx tauri signer generate -w ~/.tauri/<app>.key`. Give
-   it a password. Keep the private key and its password in your password manager.
+   it a password, or press Enter for none. Keep the private key (and its password, if any) in your
+   password manager.
 2. **Commit the public key** as `<tauri dir>/updater.pub` (the contents of
    `~/.tauri/<app>.key.pub`). The app's `build.rs` builds it in. Without it, updates are off in
    that build.
 3. **Add two secrets on the app's repository** (Settings → Secrets and variables → Actions):
-   `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/<app>.key`) and
-   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+   `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/<app>.key`) and, only if the key has a
+   password, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. A key made without a password needs no
+   password secret; if one is set anyway, it must be empty or signing fails with "incorrect updater
+   private key password".
 4. **Add `RELEASES_TOKEN`** on the app's repository too. It is a fine-grained personal access
    token (GitHub → Settings → Developer settings → Fine-grained tokens) with access to
    **snds/releases only** and the permission **Contents: Read and write**. Nothing else. One
