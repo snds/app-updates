@@ -1,0 +1,17 @@
+# Copy to /mnt/user/appdata/lockdown/compose.override.yaml (beside compose.yaml).
+# `docker compose` reads it on its own, and so does the helper.
+#
+# It puts the server on its private network with the helper and gives it the
+# helper's address and its key (host-helper.env, written by keygen, mode 600).
+services:
+  lockdown:
+    env_file:
+      - host-helper.env
+    networks:
+      - default
+      - host-helper
+
+networks:
+  host-helper:
+    name: host-helper-lockdown
+    external: true
