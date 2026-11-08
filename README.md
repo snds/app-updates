@@ -22,7 +22,7 @@ proposal, approved 2026-11-08 (U1–U6).
 | The rules: channels, version order, allowed hosts, keys, the status the page shows | `src/lib.rs` | No |
 | The local channel: `staged.json` and `running.json`, which build is newer, the signature check, the install | `src/local.rs` | No |
 | The Tauri glue: the plugin, the background check, the commands, the menu item, install on quit, reload | `src/shell.rs` (`tauri` feature) | Yes |
-| The release workflow (stamp the version, sign, write `latest.json`, publish) | to come (U6 step 3) | — |
+| The release workflow (stamp the version, sign, write `latest.json`, publish) | `.github/workflows/release-main.yml`, `release/` | — |
 
 ## Using it in an app
 
@@ -95,6 +95,82 @@ With it:
 
 Without `local`, the web feed works exactly as before.
 
+## Releasing
+
+Every push to an app's `main` can become its newest test build. The kit's reusable workflow
+builds the app, signs the update bundles with the app's own key, writes `latest.json`, and puts
+them on the app's rolling pre-release `<app>-main` in [snds/releases](https://github.com/snds/releases).
+The app's feed points there (`main_endpoint` and `main_page` above).
+
+The version is the app's own (`tauri.conf.json`) plus the commit time in UTC:
+`0.1.0-main.20261108010203`. Each later merge gets a higher number. The workflow refuses to
+publish a version that isn't newer than the one already there, so a late run never takes the
+app back.
+
+### Calling it
+
+Add a job to the app's CI. Pin the workflow and `kit-ref` to the same revision:
+
+```yaml
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release-main:
+    permissions:
+      contents: read
+    uses: snds/app-updates/.github/workflows/release-main.yml@<kit commit>
+    with:
+      app: vale                        # the release is vale-main
+      tauri-dir: apps/web/src-tauri    # the folder with tauri.conf.json
+      platforms: '["macos-universal", "windows-x64"]'   # add "linux-x64" to build the deb
+      package-manager: pnpm            # or npm
+      kit-ref: <kit commit>
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+```
+
+Other inputs, all optional: `working-directory` (where the install and the Tauri CLI run,
+default the repository root), `install-command` (default `pnpm install --frozen-lockfile` or
+`npm ci`), `tauri-command` (default `pnpm tauri` or `npx tauri`), `build-args` (extra
+`tauri build` arguments), `node-version` (default 22), `linux-packages` (extra apt packages),
+and `publish: false` to make every run a dry run.
+
+It publishes only on a push to the default branch, with all three secrets set and the app's
+`updater.pub` committed. Anything else is a **dry run**: the same builds, signed with a
+throwaway key, and the would-be `latest.json` kept as the run's `latest-json` artifact. The run's
+summary says what is missing. A dry run never fails a push for a missing secret, so the job can
+go in before the keys exist.
+
+macOS builds are signed ad hoc (there's no Developer ID yet), so macOS asks before a first open
+of a download. Updates are protected by the updater's own signature, not by Apple's.
+
+### What to set up once per app
+
+1. **Make the key pair.** In the app's folder: `npx tauri signer generate -w ~/.tauri/<app>.key`. Give
+   it a password. Keep the private key and its password in your password manager.
+2. **Commit the public key** as `<tauri dir>/updater.pub` (the contents of
+   `~/.tauri/<app>.key.pub`). The app's `build.rs` builds it in. Without it, updates are off in
+   that build.
+3. **Add two secrets on the app's repository** (Settings → Secrets and variables → Actions):
+   `TAURI_SIGNING_PRIVATE_KEY` (the contents of `~/.tauri/<app>.key`) and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+4. **Add `RELEASES_TOKEN`** on the app's repository too. It is a fine-grained personal access
+   token (GitHub → Settings → Developer settings → Fine-grained tokens) with access to
+   **snds/releases only** and the permission **Contents: Read and write**. Nothing else. One
+   token can serve every app; store it as a secret on each app repository that publishes.
+
+snds/releases needs at least one commit (a README is enough) before its first release can be
+made.
+
+The scripts behind the workflow are in `release/`: `stamp-version.py` (the version into
+`tauri.conf.json`, the app crate and `Cargo.lock`, and the front end's `package.json`) and
+`write-manifest.py` (`latest.json`, with its signature and never-backwards checks). Their tests:
+`python3 release/test_release.py`.
+
 ## Keys
 
 Each app has its own minisign key (U3). Make it once with `tauri signer generate`, keep the secret
@@ -109,6 +185,7 @@ CI update jobs, and refuses it in a release build.
 ## Checks
 
 ```sh
+python3 release/test_release.py
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test

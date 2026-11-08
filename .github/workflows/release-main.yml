@@ -1,0 +1,510 @@
+# The main channel for an snds desktop app (the unified updates proposal,
+# U1 and U6; ported from Lockdown's release.yml jobs `meta`, `macos`,
+# `windows` and `main-channel`).
+#
+# An app's CI calls this on every push to its default branch. It:
+#
+# 1. stamps the version `<x.y.z>-main.<commit time, UTC, YYYYMMDDHHMMSS>`
+#    into the app's manifests (release/stamp-version.py);
+# 2. builds each platform asked for, and signs the update bundles with the
+#    app's own updater key;
+# 3. writes `latest.json`, refusing a version that isn't newer than the one
+#    already published (release/write-manifest.py);
+# 4. publishes the bundles, their `.sig` files and `latest.json` to the
+#    rolling pre-release `<app>-main` on snds/releases, never marked latest.
+#
+# Without TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD,
+# RELEASES_TOKEN or the app's `updater.pub`, or on anything but a push to the
+# default branch, it is a dry run: the same builds, signed with a throwaway
+# key made in the job, the would-be `latest.json` kept as a workflow
+# artifact, and a job summary that says why nothing was published. A dry run
+# never fails for a missing secret.
+#
+# macOS builds are signed ad hoc (no Developer ID yet), so Gatekeeper asks
+# before a first open from the web. The updater's own signature is what
+# protects an update.
+name: Release main
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "The app's id, lower case (fontface, vale). Its release is `<app>-main` on snds/releases."
+        type: string
+        required: true
+      tauri-dir:
+        description: "Path to the app's src-tauri folder, from the repository root."
+        type: string
+        required: true
+      platforms:
+        description: 'JSON list from "macos-universal", "windows-x64", "linux-x64".'
+        type: string
+        default: '["macos-universal", "windows-x64"]'
+      package-manager:
+        description: "pnpm or npm."
+        type: string
+        default: pnpm
+      node-version:
+        type: string
+        default: "22"
+      working-directory:
+        description: "Where the install and the Tauri CLI run, from the repository root."
+        type: string
+        default: "."
+      install-command:
+        description: "Installs the front end's dependencies. Default: `pnpm install --frozen-lockfile` or `npm ci`."
+        type: string
+        default: ""
+      tauri-command:
+        description: "Runs the app's Tauri CLI. Default: `pnpm tauri` or `npx tauri`."
+        type: string
+        default: ""
+      build-args:
+        description: "Extra arguments for `tauri build` (for example `--config src-tauri/tauri.bundle.conf.json`)."
+        type: string
+        default: ""
+      linux-packages:
+        description: "Extra apt packages for the Linux build."
+        type: string
+        default: ""
+      kit-ref:
+        description: "The snds/app-updates revision whose release scripts run. Use the same one as the `uses:` line."
+        type: string
+        default: main
+      publish:
+        description: "false makes every run a dry run."
+        type: boolean
+        default: true
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY:
+        description: "The app's updater private key (`tauri signer generate`)."
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        description: "The password for that key."
+        required: false
+      RELEASES_TOKEN:
+        description: "A fine-grained token with Contents: write on snds/releases only."
+        required: false
+    outputs:
+      version:
+        description: "The version this run built."
+        value: ${{ jobs.meta.outputs.version }}
+      published:
+        description: "true when the build was published to `<app>-main`."
+        value: ${{ jobs.channel.outputs.published }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RELEASES_REPO: snds/releases
+  KIT_DIR: .app-updates-kit
+
+jobs:
+  meta:
+    name: version and plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      pub-date: ${{ steps.meta.outputs.pub-date }}
+      publish: ${{ steps.meta.outputs.publish }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+      target-from-tauri-dir: ${{ steps.meta.outputs.target-from-tauri-dir }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: meta
+        name: Read the version; decide whether this run publishes
+        env:
+          APP: ${{ inputs.app }}
+          TAURI_DIR: ${{ inputs.tauri-dir }}
+          PLATFORMS: ${{ inputs.platforms }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          WANT_PUBLISH: ${{ inputs.publish }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HAVE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          HAVE_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
+          HAVE_TOKEN: ${{ secrets.RELEASES_TOKEN != '' }}
+        run: |
+          echo "$APP" | grep -Eqx '[a-z0-9][a-z0-9-]{0,62}' || { echo "::error::app '$APP' isn't an id (lower-case letters, digits and dashes)"; exit 1; }
+          case "$PACKAGE_MANAGER" in pnpm|npm) ;; *) echo "::error::package-manager is '$PACKAGE_MANAGER', not pnpm or npm"; exit 1 ;; esac
+          conf="$TAURI_DIR/tauri.conf.json"
+          [ -f "$conf" ] || { echo "::error::no $conf"; exit 1; }
+          base=$(jq -r '.version // empty' "$conf")
+          echo "$base" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::$conf's version is '$base', not x.y.z"; exit 1; }
+          # The commit's own time: a rerun of a commit gets the same version,
+          # and each later merge a higher one.
+          version="$base-main.$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S)"
+          pub_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"
+
+          matrix=$(python3 - <<'PY'
+          import json, os, sys
+          known = {
+              "macos-universal": {"runner": "macos-latest", "kind": "darwin", "python": "python3",
+                                  "rust-targets": "aarch64-apple-darwin x86_64-apple-darwin",
+                                  "args": "--target universal-apple-darwin --bundles app,dmg"},
+              "windows-x64": {"runner": "windows-latest", "kind": "windows", "python": "python",
+                              "rust-targets": "", "args": "--bundles nsis"},
+              "linux-x64": {"runner": "ubuntu-22.04", "kind": "linux", "python": "python3",
+                            "rust-targets": "", "args": "--bundles deb"},
+          }
+          try:
+              want = json.loads(os.environ["PLATFORMS"])
+          except json.JSONDecodeError:
+              sys.exit(f"::error::platforms isn't a JSON list: {os.environ['PLATFORMS']}")
+          if not isinstance(want, list) or not want or len(set(want)) != len(want):
+              sys.exit("::error::platforms must be a non-empty JSON list without repeats")
+          unknown = [p for p in want if p not in known]
+          if unknown:
+              sys.exit(f"::error::unknown platforms {unknown}; known: {sorted(known)}")
+          print(json.dumps({"include": [dict(platform=p, **known[p]) for p in want]}))
+          PY
+          )
+
+          missing=()
+          [ "$HAVE_KEY" = true ] || missing+=("TAURI_SIGNING_PRIVATE_KEY")
+          [ "$HAVE_PASSWORD" = true ] || missing+=("TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
+          [ "$HAVE_TOKEN" = true ] || missing+=("RELEASES_TOKEN")
+          reasons=()
+          for s in "${missing[@]}"; do reasons+=("the secret \`$s\` isn't set"); done
+          [ -s "$TAURI_DIR/updater.pub" ] || reasons+=("\`$TAURI_DIR/updater.pub\` (the app's public key) isn't committed")
+          [ "$WANT_PUBLISH" = true ] || reasons+=("the caller passed \`publish: false\`")
+          if [ "$EVENT" != push ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            reasons+=("this run is a \`$EVENT\` on \`$REF\`, not a push to \`$DEFAULT_BRANCH\`")
+          fi
+          publish=true
+          [ ${#reasons[@]} -eq 0 ] || publish=false
+
+          # Swatinem/rust-cache wants the target folder relative to the crate.
+          target_rel=$(realpath -m --relative-to="$TAURI_DIR" target)
+
+          {
+            echo "version=$version"
+            echo "pub-date=$pub_date"
+            echo "publish=$publish"
+            echo "matrix=$matrix"
+            echo "target-from-tauri-dir=$target_rel"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## $APP $version"
+            echo
+            echo "Platforms: \`$(echo "$matrix" | jq -r '[.include[].platform] | join("`, `")')\`."
+            echo
+            if [ "$publish" = true ]; then
+              echo "This run publishes to [\`$APP-main\`](https://github.com/$RELEASES_REPO/releases/tag/$APP-main) on $RELEASES_REPO."
+            else
+              echo "**Dry run: nothing is published.** The builds are signed with a throwaway key, and the would-be \`latest.json\` is kept as a workflow artifact. Why:"
+              echo
+              for r in "${reasons[@]}"; do echo "- $r"; done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "version $version, publishes: $publish"
+          for r in "${reasons[@]}"; do echo "::notice title=Dry run::$r"; done
+
+  build:
+    name: build · ${{ matrix.platform }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.meta.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      PUBLISH: ${{ needs.meta.outputs.publish }}
+      TAURI_DIR: ${{ inputs.tauri-dir }}
+      APP_DIR: ${{ inputs.working-directory }}
+      PACKAGE_MANAGER: ${{ inputs.package-manager }}
+      # One target folder at the repository root, whatever the app's layout.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: snds/app-updates
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.KIT_DIR }}
+          persist-credentials: false
+      - name: Stamp the version
+        run: ${{ matrix.python }} "$KIT_DIR/release/stamp-version.py" "$VERSION" "$TAURI_DIR"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust targets (inside the app, so its rust-toolchain.toml applies)
+        if: matrix.rust-targets != ''
+        working-directory: ${{ inputs.tauri-dir }}
+        env:
+          TARGETS: ${{ matrix.rust-targets }}
+        run: |
+          # The targets are one word each.
+          # shellcheck disable=SC2086
+          rustup target add $TARGETS
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ${{ inputs.tauri-dir }} -> ${{ needs.meta.outputs.target-from-tauri-dir }}
+          key: release-main-${{ matrix.platform }}
+      - name: Linux libraries for Tauri
+        if: matrix.kind == 'linux'
+        env:
+          EXTRA: ${{ inputs.linux-packages }}
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev libxdo-dev file pkg-config $EXTRA
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        if: inputs.package-manager == 'pnpm'
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          INSTALL: ${{ inputs.install-command }}
+        run: |
+          if [ -z "$INSTALL" ]; then
+            if [ "$PACKAGE_MANAGER" = pnpm ]; then INSTALL="pnpm install --frozen-lockfile"; else INSTALL="npm ci"; fi
+          fi
+          echo "$INSTALL"
+          eval "$INSTALL"
+      - name: Updater key and config
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          CLI_INPUT: ${{ inputs.tauri-command }}
+        run: |
+          RUN_TAURI="$CLI_INPUT"
+          if [ -z "$RUN_TAURI" ]; then
+            if [ "$PACKAGE_MANAGER" = pnpm ]; then RUN_TAURI="pnpm tauri"; else RUN_TAURI="npx tauri"; fi
+          fi
+          echo "RUN_TAURI=$RUN_TAURI" >> "$GITHUB_ENV"
+          # The bundler checks each signature against plugins.updater.pubkey
+          # right after signing. Publishing, that is the app's own key, so a
+          # secret that doesn't match updater.pub stops the build here.
+          if [ "$PUBLISH" = true ]; then
+            pub=$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/$TAURI_DIR/updater.pub")
+            echo "signing the update bundles with the app's key"
+          else
+            # shellcheck disable=SC2086
+            $RUN_TAURI signer generate --ci -p "" -w "$RUNNER_TEMP/throwaway-updater.key" > /dev/null
+            pub=$(tr -d '[:space:]' < "$RUNNER_TEMP/throwaway-updater.key.pub")
+            echo "THROWAWAY_KEY=$RUNNER_TEMP/throwaway-updater.key" >> "$GITHUB_ENV"
+            echo "dry run: signing the update bundles with a throwaway key"
+          fi
+          printf '{"bundle":{"createUpdaterArtifacts":true},"plugins":{"updater":{"pubkey":"%s"}}}\n' "$pub" > "$RUNNER_TEMP/release-main.conf.json"
+      - name: Ad-hoc signing identity (macOS)
+        if: matrix.kind == 'darwin'
+        # Tauri's ad-hoc identity "-" seals the whole bundle, so macOS offers
+        # "Open Anyway" instead of calling the download damaged.
+        run: echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+      - name: Build and bundle
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ needs.meta.outputs.publish == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ needs.meta.outputs.publish == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          PLATFORM_ARGS: ${{ matrix.args }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          if [ -n "${THROWAWAY_KEY:-}" ]; then
+            TAURI_SIGNING_PRIVATE_KEY="$(cat "$THROWAWAY_KEY")"; TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+          fi
+          export TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          # shellcheck disable=SC2086
+          $RUN_TAURI build --ci $PLATFORM_ARGS --config "$RUNNER_TEMP/release-main.conf.json" $BUILD_ARGS
+      - name: Sign the deb (Linux links to it; the bundler signs only its updater bundles)
+        if: matrix.kind == 'linux'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ needs.meta.outputs.publish == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ needs.meta.outputs.publish == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        run: |
+          if [ -n "${THROWAWAY_KEY:-}" ]; then
+            TAURI_SIGNING_PRIVATE_KEY="$(cat "$THROWAWAY_KEY")"; TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+          fi
+          export TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          for deb in "$CARGO_TARGET_DIR"/release/bundle/deb/*.deb; do
+            # shellcheck disable=SC2086
+            $RUN_TAURI signer sign --app-version "$VERSION" "$deb"
+          done
+      - name: Collect
+        env:
+          KIND: ${{ matrix.kind }}
+        run: |
+          mkdir -p out
+          shopt -s nullglob
+          case "$KIND" in
+            darwin)
+              bundle=target/universal-apple-darwin/release/bundle
+              tarballs=("$bundle"/macos/*.app.tar.gz)
+              [ ${#tarballs[@]} -eq 1 ] || { echo "::error::expected one .app.tar.gz, found ${#tarballs[@]}"; exit 1; }
+              name=$(basename "${tarballs[0]}" .app.tar.gz)
+              cp "${tarballs[0]}" "out/${name}_${VERSION}_universal.app.tar.gz"
+              cp "${tarballs[0]}.sig" "out/${name}_${VERSION}_universal.app.tar.gz.sig"
+              cp "$bundle"/dmg/*.dmg out/
+              ;;
+            windows)
+              cp target/release/bundle/nsis/*-setup.exe target/release/bundle/nsis/*-setup.exe.sig out/
+              ;;
+            linux)
+              cp target/release/bundle/deb/*.deb target/release/bundle/deb/*.deb.sig out/
+              ;;
+          esac
+          rm -f "${THROWAWAY_KEY:-/nonexistent}" "${THROWAWAY_KEY:-/nonexistent}.pub"
+          ls -la out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-main-${{ matrix.platform }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  channel:
+    name: ${{ needs.meta.outputs.publish == 'true' && 'publish' || 'dry run' }} · latest.json
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # One publish per app at a time; a later run waits rather than racing.
+    concurrency:
+      group: release-main-${{ inputs.app }}
+      cancel-in-progress: false
+    outputs:
+      published: ${{ steps.publish.outputs.published || 'false' }}
+    env:
+      APP: ${{ inputs.app }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      PUB_DATE: ${{ needs.meta.outputs.pub-date }}
+      PUBLISH: ${{ needs.meta.outputs.publish }}
+      TAURI_DIR: ${{ inputs.tauri-dir }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: snds/app-updates
+          ref: ${{ inputs.kit-ref }}
+          path: ${{ env.KIT_DIR }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: release-main-*
+          merge-multiple: true
+      - name: Every signature checks against the app's key
+        if: needs.meta.outputs.publish == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          base64 -d "$TAURI_DIR/updater.pub" > "$RUNNER_TEMP/updater.pub"
+          for sig in dist/*.sig; do
+            base64 -d "$sig" > "$RUNNER_TEMP/check.minisig"
+            minisign -V -p "$RUNNER_TEMP/updater.pub" -m "${sig%.sig}" -x "$RUNNER_TEMP/check.minisig"
+          done
+      - name: Write latest.json (never older than what is published)
+        id: manifest
+        run: |
+          shopt -s nullglob
+          bundles=()
+          for f in dist/*.app.tar.gz; do bundles+=(--bundle "darwin=$f"); done
+          for f in dist/*-setup.exe; do bundles+=(--bundle "windows=$f"); done
+          for f in dist/*.deb; do bundles+=(--bundle "linux=$f"); done
+          published="$RUNNER_TEMP/published.json"
+          url="https://github.com/$RELEASES_REPO/releases/download/$APP-main/latest.json"
+          code=$(curl -sSL --retry 3 -o "$published" -w '%{http_code}' "$url" || true)
+          case "$code" in
+            200) echo "published now: $(jq -r .version "$published")" ;;
+            404) echo "nothing published yet"; rm -f "$published" ;;
+            *)
+              rm -f "$published"
+              if [ "$PUBLISH" = true ]; then echo "::error::couldn't read $url (HTTP $code), so the version can't be checked"; exit 1; fi
+              echo "::warning::couldn't read $url (HTTP $code); the dry run skips the never-backwards check"
+              ;;
+          esac
+          if python3 "$KIT_DIR/release/write-manifest.py" --app "$APP" --repo "$RELEASES_REPO" \
+            --version "$VERSION" --pub-date "$PUB_DATE" \
+            --notes "Built from $GITHUB_REPOSITORY@$GITHUB_SHA." \
+            "${bundles[@]}" --previous "$published" --out dist/latest.json 2> "$RUNNER_TEMP/refused.txt"; then
+            cat dist/latest.json
+            files=()
+            for f in dist/*; do case "${f#dist/}" in latest.json|SHA256SUMS) ;; *) files+=("${f#dist/}") ;; esac; done
+            (cd dist && sha256sum "${files[@]}" > SHA256SUMS)
+          else
+            reason=$(cat "$RUNNER_TEMP/refused.txt")
+            echo "$reason" >&2
+            if [ "$PUBLISH" = true ]; then
+              echo "::error::$reason"
+              { echo; echo "**Not published:** $reason"; } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "::warning::$reason"
+            { echo; echo "**The manifest was refused** (a dry run, so this run still succeeds): $reason"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Keep the would-be manifest (dry run)
+        if: needs.meta.outputs.publish != 'true' && hashFiles('dist/latest.json') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: latest-json
+          path: dist/latest.json
+          retention-days: 14
+      - name: Dry run summary
+        if: needs.meta.outputs.publish != 'true'
+        run: |
+          {
+            echo
+            echo "### Dry run"
+            if [ -f dist/latest.json ]; then
+              echo "The would-be \`latest.json\` is the \`latest-json\` artifact of this run, signed with a throwaway key:"
+              echo
+              echo '```json'
+              cat dist/latest.json
+              echo '```'
+            fi
+            echo
+            echo "Files built:"
+            echo
+            for f in dist/*; do case "${f#dist/}" in latest.json|SHA256SUMS) ;; *) echo "- \`${f#dist/}\`" ;; esac; done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Replace the files on the app's main pre-release
+        id: publish
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          tag="$APP-main"
+          repo="$RELEASES_REPO"
+          title="$APP main ($VERSION)"
+          notes="The newest build of $GITHUB_REPOSITORY's main branch ($VERSION, $GITHUB_SHA). The app updates itself from here. Not a release."
+          if gh release view "$tag" --repo "$repo" > /dev/null 2>&1; then
+            gh release edit "$tag" --repo "$repo" --prerelease --latest=false --title "$title" --notes "$notes"
+          else
+            # A release needs a commit to tag: an empty repository has none.
+            gh api "repos/$repo/commits?per_page=1" > /dev/null 2>&1 || {
+              echo "::error::$repo has no commits yet (or RELEASES_TOKEN can't read it). Commit a README there once, then rerun."
+              exit 1
+            }
+            gh release create "$tag" --repo "$repo" --prerelease --latest=false --title "$title" --notes "$notes"
+          fi
+          keep=$(cd dist && ls)
+          # The bundles first, latest.json last: the old manifest names the
+          # old files until the new one replaces it.
+          files=()
+          for f in dist/*; do [ "$f" = dist/latest.json ] || files+=("$f"); done
+          gh release upload "$tag" --repo "$repo" --clobber "${files[@]}"
+          gh release upload "$tag" --repo "$repo" --clobber dist/latest.json
+          gh release view "$tag" --repo "$repo" --json assets -q '.assets[].name' | while read -r old; do
+            echo "$keep" | grep -qxF "$old" || gh release delete-asset "$tag" "$old" --repo "$repo" --yes
+          done
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "Published $VERSION to [\`$tag\`](https://github.com/$repo/releases/tag/$tag)."
+          } >> "$GITHUB_STEP_SUMMARY"

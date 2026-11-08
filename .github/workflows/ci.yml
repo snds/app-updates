@@ -9,6 +9,20 @@ permissions:
   contents: read
 
 jobs:
+  # The release scripts (release/): standard library only, every platform the workflow runs them on.
+  release-scripts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 release/test_release.py -v
+        if: runner.os != 'Windows'
+      - run: python release/test_release.py -v
+        if: runner.os == 'Windows'
+
   # The rules alone: no window, every platform.
   rules:
     strategy:
