@@ -90,7 +90,7 @@ def stamp(root: Path, tauri_dir: str, version: str) -> list[str]:
     if json.loads(text).get("version") != version:
         raise SystemExit(f"stamp-version: couldn't write the version into {tauri_dir}/tauri.conf.json")
     conf.write_text(text)
-    changed.append(str(conf.relative_to(root)))
+    changed.append(conf.relative_to(root).as_posix())
 
     manifest = app / "Cargo.toml"
     if not manifest.is_file():
@@ -102,7 +102,7 @@ def stamp(root: Path, tauri_dir: str, version: str) -> list[str]:
         workspace = _upward(app.parent, root, "Cargo.toml", "[workspace.package]")
         if not workspace or not _replace_in_section(workspace, "workspace.package", base, version):
             raise SystemExit(f"stamp-version: the workspace's version isn't {base}")
-        changed.append(str(workspace.relative_to(root)))
+        changed.append(workspace.relative_to(root).as_posix())
         # Every crate that inherits the version moves with it.
         for other in sorted(workspace.parent.rglob("Cargo.toml")):
             if any(p in SKIP or p.startswith(".") for p in other.relative_to(workspace.parent).parts) or other == workspace:
@@ -114,7 +114,7 @@ def stamp(root: Path, tauri_dir: str, version: str) -> list[str]:
     else:
         if not _replace_in_section(manifest, "package", base, version):
             raise SystemExit(f"stamp-version: {tauri_dir}/Cargo.toml's version isn't {base}")
-        changed.append(str(manifest.relative_to(root)))
+        changed.append(manifest.relative_to(root).as_posix())
 
     # A path dependency's requirement on a stamped crate ("0.1.0") doesn't
     # match a pre-release, so it names the stamped version too.
@@ -129,7 +129,7 @@ def stamp(root: Path, tauri_dir: str, version: str) -> list[str]:
         )
         if after != before:
             other.write_text(after)
-            changed.append(f"{other.relative_to(root)} (path dependencies)")
+            changed.append(f"{other.relative_to(root).as_posix()} (path dependencies)")
 
     lock = _upward(app, root, "Cargo.lock")
     if lock:
@@ -145,13 +145,13 @@ def stamp(root: Path, tauri_dir: str, version: str) -> list[str]:
         if count == 0:
             raise SystemExit(f"stamp-version: {lock.relative_to(root)} has no {sorted(crates)} at {base}")
         lock.write_text("[[package]]".join(blocks))
-        changed.append(f"{lock.relative_to(root)} ({count} crates)")
+        changed.append(f"{lock.relative_to(root).as_posix()} ({count} crates)")
 
     package = app.parent / "package.json"
     if package.is_file() and json.loads(package.read_text()).get("version") == base:
         text = package.read_text().replace(f'"version": "{base}"', f'"version": "{version}"', 1)
         package.write_text(text)
-        changed.append(str(package.relative_to(root)))
+        changed.append(package.relative_to(root).as_posix())
     return changed
 
 
