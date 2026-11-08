@@ -20,6 +20,9 @@
 //! - [`is_newer`]: only a strictly higher version is an update.
 //! - [`UpdateStatus`]: what Settings and the menu show.
 //!
+//! The local channel (builds made on this Mac by its own rebuild, U4) is in [`local`]: also no
+//! window, tested on every platform.
+//!
 //! The window's half (the plugin, the commands, the background check, the menu item, installing
 //! on quit, reloading) is in [`shell`], behind the `tauri` feature.
 
@@ -68,10 +71,14 @@ pub enum Channel {
     Main,
     /// Tagged releases (`v*`).
     Stable,
+    /// Builds made on this computer by its own rebuild ([`local`]), offered through
+    /// `staged.json` rather than a web feed.
+    Local,
 }
 
 impl Channel {
-    /// The channel a build of `version` follows.
+    /// The web channel a build of `version` follows. (A build on the local channel says so in
+    /// its [`shell`] config instead; its version doesn't.)
     pub fn of(version: &Version) -> Self {
         let pre = version.pre.as_str();
         if pre == "main" || pre.starts_with("main.") {
@@ -86,6 +93,7 @@ impl Channel {
         match self {
             Self::Main => Some(feed.main_endpoint),
             Self::Stable => feed.stable_endpoint,
+            Self::Local => None,
         }
     }
 
@@ -94,6 +102,7 @@ impl Channel {
         match self {
             Self::Main => Some(feed.main_page),
             Self::Stable => feed.stable_page,
+            Self::Local => None,
         }
     }
 }
@@ -368,6 +377,17 @@ impl UpdateStatus {
         }
     }
 
+    /// The status at launch of a build on the local channel ([`local`]): it always checks (it
+    /// needs no key), and has no web feed.
+    pub fn at_start_local(version: &Version, auto_check: bool) -> Self {
+        Self {
+            channel: Channel::Local,
+            enabled: true,
+            off: None,
+            ..Self::at_start(version, &Err(Off::NoKey), auto_check)
+        }
+    }
+
     /// Moves to `state`, clearing what belonged to the one before.
     pub fn to(&mut self, state: UpdateState) {
         self.state = state;
@@ -396,6 +416,8 @@ pub fn percent(received: u64, total: Option<u64>) -> Option<u8> {
     let total = total.filter(|t| *t > 0)?;
     Some(((received.min(total) * 100) / total).min(99) as u8)
 }
+
+pub mod local;
 
 #[cfg(feature = "tauri")]
 pub mod shell;

@@ -230,3 +230,18 @@ fn a_key_is_read_from_the_key_not_its_comment() {
     assert_eq!(key_id("bm90IGEga2V5"), None);
     assert!(!key_is_valid("bm90IGEga2V5"));
 }
+
+#[test]
+fn a_local_build_says_local_and_always_checks() {
+    let version = v("0.1.0");
+    let s = UpdateStatus::at_start_local(&version, false);
+    assert_eq!(s.channel, Channel::Local);
+    assert!(s.enabled);
+    assert_eq!(s.off, None);
+    assert!(!s.auto_check);
+    assert_eq!(s.state, UpdateState::Idle);
+    let json = serde_json::to_value(&s).unwrap();
+    assert_eq!(json["channel"], "local");
+    assert_eq!(Channel::Local.endpoint(&FEED), None);
+    assert_eq!(Channel::Local.page(&FEED), None);
+}

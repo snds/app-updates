@@ -20,6 +20,7 @@ proposal, approved 2026-11-08 (U1–U6).
 | Part | Where | Needs a window |
 |---|---|---|
 | The rules: channels, version order, allowed hosts, keys, the status the page shows | `src/lib.rs` | No |
+| The local channel: `staged.json` and `running.json`, which build is newer, the signature check, the install | `src/local.rs` | No |
 | The Tauri glue: the plugin, the background check, the commands, the menu item, install on quit, reload | `src/shell.rs` (`tauri` feature) | Yes |
 | The release workflow (stamp the version, sign, write `latest.json`, publish) | to come (U6 step 3) | — |
 
@@ -27,7 +28,7 @@ proposal, approved 2026-11-08 (U1–U6).
 
 ```toml
 [dependencies]
-snds-app-updates = { git = "https://github.com/snds/app-updates", tag = "v0.1.0", features = ["tauri"] }
+snds-app-updates = { git = "https://github.com/snds/app-updates", tag = "v0.2.0", features = ["tauri"] }
 ```
 
 1. Describe the app's feed:
@@ -54,6 +55,45 @@ snds-app-updates = { git = "https://github.com/snds/app-updates", tag = "v0.1.0"
    plugin from Rust.
 
 The page hears every change on the app's event (`"<app>://update"`) as an `UpdateStatus`.
+
+## Local channel
+
+Until an app has a paid Apple membership, its updates come from the Mac's own rebuild instead of a
+web feed (the unified updates proposal, U4). The rebuild builds and signs the app, then writes
+`staged.json` in the app's updates folder,
+`~/Library/Application Support/snds/updates/<bundle id>/` (`local::updates_dir`). The running app
+reads it and offers **Restart to update**. The person chooses when.
+
+Give `Config` a `local` source to use it:
+
+```rust
+local: Some(app_updates::shell::LocalSource {
+    updates_dir: app_updates::local::updates_dir(&home, "design.snds.sy"),
+    // Built in by the app's build.rs: the commit and its committer time in UTC.
+    build: app_updates::local::LocalBuild { commit: COMMIT.into(), commit_time: COMMIT_TIME.into() },
+    installed_bundle: home.join("Applications/Synapse.app"),
+}),
+```
+
+With it:
+
+- **At launch** the app writes `running.json` (its pid, the bundle it runs from, its commit, and
+  `local_updates: true`). The rebuild sees it and leaves the app running. The app removes it on a
+  clean quit.
+- **A check** reads `staged.json`. No file means up to date. A build is newer only when its commit
+  differs and its commit time is later. A newer build must pass `codesign --verify --deep --strict`
+  and be signed by the same team as the running app; then it's ready at once, with nothing to
+  download. The status shows `channel: "local"` and the build as `1a2b3c4 (2026-11-08 01:00 UTC)`.
+  Anything wrong shows as a failed check, in plain words.
+- **Automatically** the app checks at launch and then every five minutes, the rebuild's own timer,
+  while **Check automatically** is on. **Check for updates** reads the file at once.
+- **Restart to update**, **Reload app** with a build ready, and quitting all install it with
+  `local::install_staged`: `ditto` copies the build beside the installed app, the copy's signature
+  is checked again, the old app is renamed aside, the copy is renamed into place, and the old one is
+  removed. If the copy can't go in, the old app is put back. Quitting installs without reopening.
+- Off a Mac the check fails with "Local builds can be checked and installed only on a Mac."
+
+Without `local`, the web feed works exactly as before.
 
 ## Keys
 
