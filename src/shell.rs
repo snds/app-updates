@@ -19,7 +19,7 @@
 //! An app wires it in four places: `.plugin(shell::plugin())` on the builder, [`start`] in
 //! `setup`, [`on_exit`] on `RunEvent::Exit`, and its commands. The kit's [`commands`] are ready to
 //! register; an app with its own error type wraps [`status`], [`check_now`], [`restart`],
-//! [`set_auto_check`] and [`reload`] in its own commands instead.
+//! [`set_auto_check`] (or [`auto_check_saved`]) and [`reload`] in its own commands instead.
 
 use std::sync::{Arc, Mutex};
 
@@ -458,20 +458,26 @@ pub fn reload(handle: &AppHandle) -> Result<(), String> {
     handle.restart()
 }
 
-/// The "Check automatically" switch: the host saves it; turning it on checks at once when nothing
-/// has been checked since launch.
+/// The "Check automatically" switch: the host saves it, then [`auto_check_saved`].
 pub async fn set_auto_check(handle: AppHandle, on: bool) -> Result<UpdateStatus, String> {
-    let updates = updates(&handle)?;
-    let host = updates.host.clone();
+    let host = updates(&handle)?.host.clone();
     tauri::async_runtime::spawn_blocking(move || host.set_auto_check(on))
         .await
         .map_err(|e| format!("the call didn't finish: {e}"))??;
+    auto_check_saved(&handle, on)
+}
+
+/// The switch was saved (by [`set_auto_check`], or by an app's own command that saves it with its
+/// own errors): the status says so, and turning it on checks at once when nothing has been
+/// checked since launch.
+pub fn auto_check_saved(handle: &AppHandle, on: bool) -> Result<UpdateStatus, String> {
+    let updates = updates(handle)?;
     let idle = {
         let mut inner = updates.lock();
         inner.status.auto_check = on;
         inner.status.state == UpdateState::Idle
     };
-    emit(&handle, &updates);
+    emit(handle, &updates);
     if on && idle {
         tauri::async_runtime::spawn(check(handle.clone(), false));
     }
