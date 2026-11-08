@@ -15,17 +15,26 @@
 //!   without relaunching it.
 //! - **Automatically**: at launch and every six hours, while the host's switch is on.
 //! - **macOS**: "Check for Updates…" in the app menu does what the button does.
+//! - **Local channel** ([`Config::local`]): instead of a web feed, the app reads the build its
+//!   own Mac's rebuild staged (`staged.json` in the updates folder, [`crate::local`]). A newer
+//!   build whose signature checks out is ready at once (nothing to download); Restart to update,
+//!   Reload app and the quit install it with [`crate::local::install_staged`]. The app writes
+//!   `running.json` at launch and removes it on quit, so the rebuild leaves it running. The
+//!   automatic check re-reads the file at launch and every five minutes
+//!   ([`crate::local::LOCAL_CHECK_EVERY`], the rebuild's own timer) instead of every six hours.
 //!
 //! An app wires it in four places: `.plugin(shell::plugin())` on the builder, [`start`] in
 //! `setup`, [`on_exit`] on `RunEvent::Exit`, and its commands. The kit's [`commands`] are ready to
 //! register; an app with its own error type wraps [`status`], [`check_now`], [`restart`],
 //! [`set_auto_check`] (or [`auto_check_saved`]) and [`reload`] in its own commands instead.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::local::{LOCAL_CHECK_EVERY, LocalBuild, Running, Staged};
 use crate::{
     CHECK_EVERY, Feed, Install, NETWORK_TIMEOUT, Off, Source, TestSource, UpdateState,
     UpdateStatus, allowed, is_newer, percent, plan,
@@ -71,6 +80,21 @@ pub struct Config {
     pub event: &'static str,
     /// The macOS app menu's "Check for Updates…" item ID.
     pub menu_id: &'static str,
+    /// The local channel: builds this Mac's rebuild stages, in place of the web feed. `None`
+    /// follows the feed, as before.
+    pub local: Option<LocalSource>,
+}
+
+/// Where a build on the local channel looks, and what it replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalSource {
+    /// The app's updates folder, holding `staged.json` and `running.json`
+    /// ([`crate::local::updates_dir`]).
+    pub updates_dir: PathBuf,
+    /// The running build's identity, built in.
+    pub build: LocalBuild,
+    /// The installed bundle a staged build replaces (`~/Applications/<App>.app`).
+    pub installed_bundle: PathBuf,
 }
 
 /// The plugin, configured from Rust. The app's `plugins.updater` block in `tauri.conf.json` holds
@@ -83,16 +107,25 @@ pub fn plugin() -> tauri::plugin::TauriPlugin<tauri::Wry, tauri_plugin_updater::
 /// What a check found.
 enum Found {
     UpToDate,
-    /// Downloaded and checked, waiting for a restart or the quit.
-    Ready(Box<Update>, Vec<u8>),
+    /// Downloaded (or, on the local channel, staged) and checked, waiting for a restart or the
+    /// quit.
+    Ready(Ready),
     /// Newer, but this copy can't replace itself.
     Available(String),
 }
 
+/// An update waiting to install.
+enum Ready {
+    /// From the web feed: the update and its checked bytes.
+    Web(Box<Update>, Vec<u8>),
+    /// From this Mac's rebuild: the staged build.
+    Local(Staged),
+}
+
 struct Inner {
     status: UpdateStatus,
-    /// The downloaded update and its checked bytes.
-    ready: Option<(Box<Update>, Vec<u8>)>,
+    /// The update waiting to install.
+    ready: Option<Ready>,
     /// A check or a download is running.
     busy: bool,
 }
@@ -102,6 +135,7 @@ pub struct Updates {
     app: &'static str,
     event: &'static str,
     source: Result<Source, Off>,
+    local: Option<LocalSource>,
     install: Install,
     host: Arc<dyn Host>,
     inner: Mutex<Inner>,
@@ -137,20 +171,35 @@ fn emit(handle: &AppHandle, updates: &Updates) {
 }
 
 /// Sets up the updater: the plan, the status, the macOS menu item, and the automatic check at
-/// launch and every six hours.
+/// launch and every six hours (every five minutes on the local channel, which also writes
+/// `running.json` here).
 pub fn start(handle: &AppHandle, config: Config, host: Arc<dyn Host>) {
     let version = handle.package_info().version.clone();
     let source = plan(&config.feed, &version, config.key, config.test);
+    let status = match config.local {
+        Some(_) => UpdateStatus::at_start_local(&version, host.auto_check()),
+        None => UpdateStatus::at_start(&version, &source, host.auto_check()),
+    };
+    if let Some(local) = &config.local {
+        let record = Running::new(&local.build, &running_bundle(local));
+        if let Err(e) = record.write(&local.updates_dir) {
+            log::warn!("{e}");
+        }
+    }
     let updates = Arc::new(Updates {
         app: config.feed.app,
         event: config.event,
-        install: install_mode(config.feed.app),
+        install: match config.local {
+            Some(_) => Install::InPlace,
+            None => install_mode(config.feed.app),
+        },
         inner: Mutex::new(Inner {
-            status: UpdateStatus::at_start(&version, &source, host.auto_check()),
+            status,
             ready: None,
             busy: false,
         }),
         source,
+        local: config.local,
         host,
     });
     handle.manage(updates.clone());
@@ -163,9 +212,13 @@ pub fn start(handle: &AppHandle, config: Config, host: Arc<dyn Host>) {
     }
     #[cfg(not(target_os = "macos"))]
     let _ = config.menu_id;
-    if updates.source.is_err() {
+    if updates.source.is_err() && updates.local.is_none() {
         return;
     }
+    let every = match updates.local {
+        Some(_) => LOCAL_CHECK_EVERY,
+        None => CHECK_EVERY,
+    };
     let handle = handle.clone();
     let _ = std::thread::Builder::new()
         .name(format!("{}-updates", updates.app.to_lowercase()))
@@ -174,17 +227,21 @@ pub fn start(handle: &AppHandle, config: Config, host: Arc<dyn Host>) {
                 if updates.host.auto_check() {
                     tauri::async_runtime::block_on(check(handle.clone(), false));
                 }
-                std::thread::sleep(CHECK_EVERY);
+                std::thread::sleep(every);
             }
         });
 }
 
 /// Checks the channel, and downloads a newer build in the background. `asked`: the button or the
-/// menu, not the automatic check.
+/// menu, not the automatic check. On the local channel, reads `staged.json` instead (every
+/// time, even with a build ready, since a later rebuild may have staged a newer one).
 pub async fn check(handle: AppHandle, asked: bool) {
     let Ok(updates) = updates(&handle) else {
         return;
     };
+    if let Some(local) = updates.local.clone() {
+        return check_local(handle, updates, local, asked).await;
+    }
     let Ok(source) = updates.source.clone() else {
         return;
     };
@@ -216,10 +273,13 @@ pub async fn check(handle: AppHandle, asked: bool) {
         inner.busy = false;
         match found {
             Ok(Found::UpToDate) => inner.status.to(UpdateState::UpToDate),
-            Ok(Found::Ready(update, bytes)) => {
+            Ok(Found::Ready(ready)) => {
                 inner.status.to(UpdateState::Ready);
-                inner.status.offered = Some(update.version.clone());
-                inner.ready = Some((update, bytes));
+                inner.status.offered = Some(match &ready {
+                    Ready::Web(update, _) => update.version.clone(),
+                    Ready::Local(staged) => staged.label(),
+                });
+                inner.ready = Some(ready);
             }
             Ok(Found::Available(version)) => {
                 inner.status.to(UpdateState::Available);
@@ -314,7 +374,98 @@ async fn find(
         )
         .await
         .map_err(|e| words(app, &e, refused_words()))?;
-    Ok(Found::Ready(Box::new(update), bytes))
+    Ok(Found::Ready(Ready::Web(Box::new(update), bytes)))
+}
+
+/// The local channel's check: `staged.json`, then the staged bundle's signature.
+async fn check_local(handle: AppHandle, updates: Arc<Updates>, local: LocalSource, asked: bool) {
+    {
+        let mut inner = updates.lock();
+        if inner.busy {
+            return;
+        }
+        inner.busy = true;
+        inner.status.asked = asked;
+        inner.status.to(UpdateState::Checking);
+    }
+    emit(&handle, &updates);
+    let app = updates.app;
+    let found = tauri::async_runtime::spawn_blocking(move || find_local(app, &local))
+        .await
+        .unwrap_or_else(|e| Err(format!("The check didn't finish: {e}.")));
+    {
+        let mut inner = updates.lock();
+        inner.busy = false;
+        inner.ready = None;
+        match found {
+            Ok(Some(staged)) => {
+                inner.status.to(UpdateState::Ready);
+                inner.status.offered = Some(staged.label());
+                inner.ready = Some(Ready::Local(staged));
+            }
+            Ok(None) => inner.status.to(UpdateState::UpToDate),
+            Err(words) => {
+                inner.status.to(UpdateState::Failed);
+                inner.status.error = Some(words);
+            }
+        }
+    }
+    emit(&handle, &updates);
+}
+
+/// The staged build, when it's newer than this one and its signature checks out.
+fn find_local(app: &str, local: &LocalSource) -> Result<Option<Staged>, String> {
+    let Some(staged) = Staged::read(&local.updates_dir)? else {
+        return Ok(None);
+    };
+    if staged.app != app {
+        return Err(format!(
+            "The staged build is for {}, not {app}.",
+            staged.app
+        ));
+    }
+    if !crate::local::is_newer_staged(&local.build, &staged) {
+        return Ok(None);
+    }
+    crate::local::verify_staged(&staged.bundle, &running_bundle(local))?;
+    Ok(Some(staged))
+}
+
+/// The bundle this app is running from: on macOS, the one holding its executable; otherwise (or
+/// when that can't be found) the installed one.
+fn running_bundle(local: &LocalSource) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| tauri_plugin_updater::extract_path_from_executable(&exe).ok())
+    {
+        return bundle;
+    }
+    local.installed_bundle.clone()
+}
+
+/// Installs a waiting update (the host has got ready). `relaunch`: the web update's installer
+/// may start the new build itself (Windows); the local one never does.
+fn install_ready(updates: &Updates, ready: Ready, relaunch: bool) -> Result<(), String> {
+    match ready {
+        Ready::Web(update, bytes) => {
+            let update = if relaunch {
+                *update
+            } else {
+                (*update).restart_after_install(false)
+            };
+            update
+                .install(&bytes)
+                .map_err(|e| words(updates.app, &e, None))
+        }
+        Ready::Local(staged) => {
+            let local = updates
+                .local
+                .as_ref()
+                .ok_or_else(|| "this build has no local channel".to_string())?;
+            crate::local::install_staged(&staged.bundle, &local.installed_bundle)
+        }
+    }
 }
 
 /// The plugin's error in plain words. Nothing here can carry a secret: the requests hold none.
@@ -428,14 +579,13 @@ pub fn check_now(handle: &AppHandle) -> Result<UpdateStatus, String> {
 /// the passive installer closes the app and starts the new one itself.
 pub fn restart(handle: &AppHandle) -> Result<(), String> {
     let updates = updates(handle).map_err(|_| "there's no update to install".to_string())?;
-    let (update, bytes) = updates
+    let ready = updates
         .lock()
         .ready
         .take()
         .ok_or_else(|| "there's no update to install yet".to_string())?;
     updates.host.before_restart(handle);
-    if let Err(e) = update.install(&bytes) {
-        let message = words(updates.app, &e, None);
+    if let Err(message) = install_ready(&updates, ready, true) {
         let mut inner = updates.lock();
         inner.status.to(UpdateState::Failed);
         inner.status.error = Some(message.clone());
@@ -484,16 +634,24 @@ pub fn auto_check_saved(handle: &AppHandle, on: bool) -> Result<UpdateStatus, St
     Ok(updates.status())
 }
 
-/// The app is closing: a downloaded update installs now, without a relaunch.
+/// The app is closing: a downloaded (or staged) update installs now, without a relaunch. On the
+/// local channel, `running.json` is removed after it.
 pub fn on_exit(handle: &AppHandle) {
     let Ok(updates) = updates(handle) else {
         return;
     };
-    let Some((update, bytes)) = updates.lock().ready.take() else {
-        return;
-    };
-    updates.host.before_restart(handle);
-    let _ = (*update).restart_after_install(false).install(&bytes);
+    let ready = updates.lock().ready.take();
+    if let Some(ready) = ready {
+        updates.host.before_restart(handle);
+        if let Err(e) = install_ready(&updates, ready, false) {
+            log::warn!("the update didn't install on quit: {e}");
+        }
+    }
+    if let Some(local) = &updates.local
+        && let Err(e) = Running::remove(&local.updates_dir, std::process::id())
+    {
+        log::warn!("{e}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -569,3 +727,6 @@ pub mod commands {
 
 #[cfg(all(test, feature = "test-runtime"))]
 mod plugin_tests;
+
+#[cfg(test)]
+mod local_tests;
