@@ -42,5 +42,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --all-targets --features tauri,update-test -- -D warnings
-      - run: cargo test --features tauri,update-test
+      - run: cargo clippy --all-targets --features tauri,update-test,test-runtime -- -D warnings
+      - run: cargo test --features tauri,update-test,test-runtime

@@ -20,6 +20,8 @@ tauri = ["dep:tauri", "dep:tauri-plugin-updater", "dep:reqwest", "dep:log"]
 # A test-only update source read from the environment (end-to-end runs). An
 # app turns it on only for its CI update jobs, and refuses it in a release.
 update-test = []
+# Tauri's mock runtime, for the plugin's own signature tests (CI's shell job).
+test-runtime = ["tauri", "tauri/test"]
 
 [dependencies]
 data-encoding = "2.11"
@@ -34,4 +36,3 @@ log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
-tauri = { version = "2.12.3", features = ["test"] }

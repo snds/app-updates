@@ -72,5 +72,5 @@ CI update jobs, and refuses it in a release build.
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test --features tauri,update-test
+cargo test --features tauri,update-test,test-runtime
 ```

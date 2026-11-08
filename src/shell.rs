@@ -567,5 +567,5 @@ pub mod commands {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-runtime"))]
 mod plugin_tests;
