@@ -1,0 +1,38 @@
+[package]
+name = "snds-app-updates"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "The shared update kit for snds desktop apps: update rules, and the Tauri glue for checking, restarting to update and reloading the app."
+repository = "https://github.com/snds/app-updates"
+publish = false
+
+[lib]
+name = "app_updates"
+
+[features]
+default = []
+# The window's half: Tauri's updater plugin driven from Rust, the commands the
+# page calls, the background check, the macOS menu item, installing on quit,
+# and reloading the app.
+tauri = ["dep:tauri", "dep:tauri-plugin-updater", "dep:reqwest", "dep:log"]
+# A test-only update source read from the environment (end-to-end runs). An
+# app turns it on only for its CI update jobs, and refuses it in a release.
+update-test = []
+# Tauri's mock runtime, for the plugin's own signature tests (CI's shell job).
+test-runtime = ["tauri", "tauri/test"]
+
+[dependencies]
+data-encoding = "2.11"
+minisign-verify = "0.3"
+semver = "1"
+serde = { version = "1.0", features = ["derive"] }
+url = "2.5"
+tauri = { version = "2.12.3", optional = true }
+tauri-plugin-updater = { version = "2.14.1", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+log = { version = "0.4", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
