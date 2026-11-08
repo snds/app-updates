@@ -1,0 +1,49 @@
+# The host helper's own stack, on the Unraid host (see host-helper/README.md).
+#
+#   mkdir -p /mnt/user/appdata/host-helper/config/keys
+#   cp compose.yaml /mnt/user/appdata/host-helper/
+#   cp allow-list.example.toml /mnt/user/appdata/host-helper/config/allow-list.toml
+#   cd /mnt/user/appdata/host-helper && docker compose up -d
+#
+# It is the only container with the Docker socket. It publishes no port: each
+# server reaches it on its own internal network below, which has no route out
+# and holds just that server and the helper.
+name: host-helper
+
+services:
+  host-helper:
+    image: ghcr.io/snds/app-updates-host-helper:main
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m
+    mem_limit: 128m
+    pids_limit: 128
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The allow-list and the keys (read-only).
+      - /mnt/user/appdata/host-helper/config:/config:ro
+      # Each managed stack's folder, at the SAME path as on the host, so the
+      # relative paths in its compose files (./tls, .env) mean the same thing.
+      - /mnt/user/appdata/lockdown:/mnt/user/appdata/lockdown:ro
+      - /mnt/user/appdata/vale:/mnt/user/appdata/vale:ro
+    networks:
+      - lockdown
+      - vale-gateway
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "5"
+
+networks:
+  # One per stack. `internal: true`: no way out to the LAN or the internet.
+  lockdown:
+    name: host-helper-lockdown
+    internal: true
+  vale-gateway:
+    name: host-helper-vale-gateway
+    internal: true

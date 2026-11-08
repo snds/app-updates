@@ -1,0 +1,36 @@
+# The host helper's allow-list: the only things it will ever touch.
+# Lives at /mnt/user/appdata/host-helper/config/allow-list.toml.
+# Check it with:
+#   docker run --rm -v /mnt/user/appdata/host-helper/config:/config:ro \
+#     ghcr.io/snds/app-updates-host-helper:main check --config /config/allow-list.toml
+
+# Inside the helper's container. Nothing is published on the host, so this is
+# reachable only from the internal networks in its compose.yaml.
+listen = ["0.0.0.0:7480"]
+
+# <stack>.key for each stack below, mode 600 (made by `keygen`).
+keys_dir = "/config/keys"
+
+[stack.lockdown]
+# The folder with Lockdown's compose.yaml (and compose.override.yaml).
+directory = "/mnt/user/appdata/lockdown"
+# The only services it may recreate or restart.
+services = ["lockdown"]
+# The only repository it may pull, without a tag.
+image = "ghcr.io/snds/lockdown-server"
+# The tag compose.yaml names. A pulled version is tagged as this locally.
+compose_tag = "main"
+# Tags it may pull by name, plus any main-channel version (x.y.z-main.<time>).
+tags = ["main"]
+main_versions = true
+# The compose project name: leave it out if `docker compose ls` shows the
+# folder's name; set it if you started the stack with -p or a `name:`.
+# project = "lockdown"
+
+[stack.vale-gateway]
+directory = "/mnt/user/appdata/vale/apps/gateway"
+services = ["gateway"]
+image = "ghcr.io/snds/vale-gateway"
+compose_tag = "main"
+tags = ["main"]
+main_versions = true

@@ -1,0 +1,32 @@
+[package]
+name = "snds-app-updates-host-helper"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "The restart helper for a Docker host: one-click Update and Reload for snds servers, limited to an allow-list, with HMAC-signed requests. Also the client the servers call it with."
+repository = "https://github.com/snds/app-updates"
+publish = false
+
+[lib]
+name = "host_helper"
+
+[[bin]]
+name = "app-updates-host-helper"
+path = "src/main.rs"
+required-features = ["server"]
+
+[features]
+# The helper itself (the allow-list, the Docker calls, the listener). A server
+# that only calls the helper depends on this crate with
+# `default-features = false` and gets the client and the protocol alone.
+default = ["server"]
+server = ["dep:toml"]
+
+[dependencies]
+getrandom = "0.3"
+hmac = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = { version = "0.8", optional = true, default-features = false, features = ["parse"] }

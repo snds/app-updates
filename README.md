@@ -23,6 +23,7 @@ proposal, approved 2026-11-08 (U1–U6).
 | The local channel: `staged.json` and `running.json`, which build is newer, the signature check, the install | `src/local.rs` | No |
 | The Tauri glue: the plugin, the background check, the commands, the menu item, install on quit, reload | `src/shell.rs` (`tauri` feature) | Yes |
 | The release workflow (stamp the version, sign, write `latest.json`, publish) | `.github/workflows/release-main.yml`, `release/` | — |
+| The restart helper for servers on a Docker host (one-click Update and Reload, U5), and the client the servers call it with | `host-helper/` (its own crate) | — |
 
 ## Using it in an app
 
@@ -182,6 +183,16 @@ The `update-test` feature lets an end-to-end run point an app at a local feed th
 `<PREFIX>_UPDATE_TEST_ENDPOINT` and `<PREFIX>_UPDATE_TEST_PUBKEY`. An app turns it on only in its
 CI update jobs, and refuses it in a release build.
 
+## Servers: the host helper
+
+Servers (the Lockdown server, the Vale gateway, later Warpcore) can't replace their own image,
+and must never hold the Docker socket. `host-helper/` is a small service for the Docker host
+that does it for them: a server signs a request with its own key, and the helper pulls an
+allowed image at an allowed tag and recreates the allowed services, or restarts them, and
+nothing else. It ships as `ghcr.io/snds/app-updates-host-helper`, with a client the servers use
+(`default-features = false`). What it does, its threat model and the Unraid install steps:
+[host-helper/README.md](host-helper/README.md).
+
 ## Checks
 
 ```sh
@@ -191,3 +202,5 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo test --features tauri,update-test,test-runtime
 ```
+
+The host helper's own checks are in [host-helper/README.md](host-helper/README.md#checks).

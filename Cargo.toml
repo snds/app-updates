@@ -8,6 +8,10 @@ description = "The shared update kit for snds desktop apps: update rules, the lo
 repository = "https://github.com/snds/app-updates"
 publish = false
 
+[workspace]
+# The kit is the root package; the Unraid host's restart helper (U5) is its own crate.
+members = [".", "host-helper"]
+
 [lib]
 name = "app_updates"
 
