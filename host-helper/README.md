@@ -6,20 +6,25 @@ proposal, U5). A server's admin page asks; this helper, running beside it on the
 - **Update:** pull the server's image at an allowed tag, check its digest, and recreate the
   server's container on it (`docker compose up -d`).
 - **Reload:** restart the server's containers (`docker compose restart`).
-- **Status:** which image each container runs (tag, digest, version).
+- **Status:** which image each container runs (tag, digest, version), and what an update is
+  doing right now or how the last one ended.
 
-It serves the Lockdown server (`ghcr.io/snds/lockdown-server`) and the Vale gateway
-(`ghcr.io/snds/vale-gateway`). Warpcore joins once its image and deploy form are agreed.
+It serves the Lockdown server (`ghcr.io/snds/lockdown-server`), the Vale gateway
+(`ghcr.io/snds/vale-gateway`) and Warpcore (`ghcr.io/snds/warpcore-{web,api,sandbox}`, three
+images updated together, with a backup before and a self-test after: see
+[Several images, and steps around an update](#several-images-and-steps-around-an-update)).
 
 ## What it does not do
 
-- It never runs a command a request names. There are three operations, and each runs a fixed
-  `docker` command built from the allow-list.
+- It never runs a command a request names. There are three operations, and each runs fixed
+  `docker` commands built from the allow-list. A stack's `before` and `after` steps are written
+  in the allow-list too; a request only starts the update they belong to.
 - It never touches a stack, service or image that isn't on the allow-list, and never pulls a
   tag the list doesn't allow (`main`, or a main-channel version such as
   `0.1.0-main.20261108093000`).
-- It doesn't build from source, edit compose files, take backups, roll back on its own, or
-  update itself. (Take a backup before an update; to go back, update to the older version tag.)
+- It doesn't build from source, edit compose files, roll back on its own, or update itself. It
+  takes a backup only when the stack's `before` step is one. (To go back, update to the older
+  version tag, if the stack's data allows it.)
 - It isn't reachable from the LAN or the internet. It publishes no port.
 
 ## How it is deployed, and why
@@ -186,17 +191,63 @@ let status = helper.status()?;             // each service: state, image, digest
 let done = helper.update(&UpdateRequest {
     tag: Some("0.1.0-main.20261108093000".into()),   // None: the stack's own tag (main)
     expect_digest: Some("sha256:…".into()),          // from the release manifest, when known
+    ..Default::default()
 })?;
 helper.restart()?;
+
+// A stack with several images: a version tag, and every image's digest by repository.
+let done = helper.update(&UpdateRequest {
+    tag: Some("0.4.0-main.20261109010000".into()),
+    expect_digests: Some(manifest_digests),         // BTreeMap<repository, "sha256:…">
+    ..Default::default()
+})?;
+// done.images: each pulled image; done.before / done.after: each step's exit status and output.
 ```
+
+While an update runs, `status()` from another thread shows `progress.running` (the operation
+and its step: `request`, `pull`, `check`, `before`, `tag`, `recreate`, `after`, or `restart`).
+Afterwards `progress.last` says how it ended: `ok`, the `failed_step` and its `error` when it
+didn't, and the `after` step's result. It lasts until the helper restarts.
 
 Calls block (an update waits for the pull, up to 20 minutes); an async server runs them on a
 blocking thread. Every error's `Display` is a sentence to show on the admin page as is.
 
+## Several images, and steps around an update
+
+A stack can list several images, and a one-shot command to run before and after its update
+(Warpcore's block in [`deploy/allow-list.example.toml`](deploy/allow-list.example.toml)):
+
+```toml
+[stack.warpcore]
+directory = "/mnt/user/appdata/warpcore/src/deploy"
+services = ["web", "api", "sandbox"]            # never db or backup
+images = ["ghcr.io/snds/warpcore-web", "ghcr.io/snds/warpcore-api", "ghcr.io/snds/warpcore-sandbox"]
+before = { service = "backup", command = ["sh", "/backup/backup.sh", "once"] }
+after = { service = "sandbox", command = ["node", "dist/selftest.js"], no_deps = true }
+```
+
+- **Several images** are one update. The request must name a version tag (not `main`) and
+  every image's digest in `expect_digests`, keyed by repository, and nothing else. The helper
+  pulls every image at that tag and checks every digest first. If any pull or check fails,
+  nothing is tagged, nothing runs, and nothing is recreated. Because the pull is by version
+  tag, the `main` tag that compose starts is untouched until every image has passed.
+- **`before`** runs `docker compose run --rm --no-TTY --pull never -- <service> <command…>`
+  after the checks and before anything changes. If it can't run, or exits with anything but 0,
+  the update stops there and nothing is recreated. The reply says its exit status and last
+  line.
+- **`after`** runs the same way (here with `--no-deps`) once the services are up. Its exit
+  status and the last 20 lines of its output (4 KB at most) come back in the reply and in
+  `status`. A failed `after` is reported, not undone: the update has already happened, and
+  rolling back past a database migration isn't safe.
+- A step's service needn't be in `services`: `backup` runs only as the `before` step and is
+  never recreated or restarted. A step's command is fixed in the list (up to 16 arguments,
+  starting with a program, no control characters).
+
 ## The wire, for reference
 
 `POST /v1/status`, `/v1/update` or `/v1/restart`, a JSON body (`{}`, or
-`{"tag": …, "expect_digest": …}` for update), and four headers: `x-helper-stack`,
+`{"tag": …, "expect_digest": …}` or `{"tag": …, "expect_digests": {<repository>: …}}` for
+update), and four headers: `x-helper-stack`,
 `x-helper-time` (Unix seconds), `x-helper-nonce` (32 hex) and `x-helper-signature`: hex
 HMAC-SHA256 with the stack's key over
 
@@ -213,15 +264,26 @@ POST
 
 A successful reply carries `x-helper-signature` over
 `snds-app-updates-host-helper/1\nreply\n<nonce>\n<status>\n<hex SHA-256 of the body>`. A refusal
-is `{"error": <code>, "message": <sentence>}` (`tag_not_allowed`, `digest_mismatch`, `busy`,
-`rate_limited`, `stale`, `replayed`, `bad_signature`, `docker_failed`…). Code:
+is `{"error": <code>, "message": <sentence>}` (`tag_not_allowed`, `digest_mismatch`,
+`digests_required`, `bad_digests`, `before_failed`, `busy`, `rate_limited`, `stale`,
+`replayed`, `bad_signature`, `docker_failed`…). Code:
 `src/protocol.rs`.
 
-How an update runs (`src/server.rs`): check the tag against the list → `docker pull
-<repository>:<tag>` → read its digest for that repository → refuse if it differs from
-`expect_digest` → if the tag isn't the one `compose.yaml` names, `docker tag
-<repository>@<digest> <repository>:<compose tag>` → `docker compose up --detach --no-deps
---no-build --pull never -- <services>`, in the stack's folder.
+How an update runs (`src/server.rs`), one step after another, each named in `status`:
+
+1. **request:** check the tag against the list, and the expected digests.
+2. **pull:** `docker pull <repository>:<tag>` for each image.
+3. **check:** read each image's digest for its repository; refuse if any differs from what the
+   request expects.
+4. **before** (if the stack has one): `docker compose run --rm …`; stop if it fails.
+5. **tag:** if the tag isn't the one `compose.yaml` names, `docker tag <repository>@<digest>
+   <repository>:<compose tag>` for each image.
+6. **recreate:** `docker compose up --detach --no-deps --no-build --pull never -- <services>`,
+   in the stack's folder.
+7. **after** (if the stack has one): `docker compose run --rm …`, and report how it ended.
+
+Older clients and servers keep working: the new request field and reply fields are optional
+both ways.
 
 ## Checks
 

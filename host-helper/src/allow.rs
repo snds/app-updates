@@ -13,6 +13,18 @@
 //! # main_versions = true           # and any x.y.z-main.<time> tag (default true)
 //! # project = "lockdown"           # the compose project name, if not the folder's
 //! # compose_files = ["compose.yaml", "compose.override.yaml"]   # default: compose's own lookup
+//!
+//! [stack.warpcore]
+//! directory = "/mnt/user/appdata/warpcore/src/deploy"
+//! services = ["web", "api", "sandbox"]
+//! # Several images, updated together: every one is pulled and checked before any service is
+//! # recreated. Use `images` or `image`, not both.
+//! images = ["ghcr.io/snds/warpcore-web", "ghcr.io/snds/warpcore-api", "ghcr.io/snds/warpcore-sandbox"]
+//! # One-shot commands around an update, run with `docker compose run --rm`. `before` runs
+//! # after every image is checked and before anything is recreated; if it fails, nothing is.
+//! # `after` runs once the services are up; its exit status and output are reported.
+//! before = { service = "backup", command = ["sh", "/backup/backup.sh", "once"] }
+//! after = { service = "sandbox", command = ["node", "dist/selftest.js"], no_deps = true }
 //! ```
 //!
 //! The file holds no secrets: each stack's key is in its own file under `keys_dir`. Every
@@ -42,7 +54,14 @@ struct FileShape {
 struct StackShape {
     directory: PathBuf,
     services: Vec<String>,
-    image: String,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    images: Option<Vec<String>>,
+    #[serde(default)]
+    before: Option<StepShape>,
+    #[serde(default)]
+    after: Option<StepShape>,
     #[serde(default)]
     compose_tag: Option<String>,
     #[serde(default)]
@@ -54,6 +73,29 @@ struct StackShape {
     #[serde(default)]
     compose_files: Option<Vec<String>>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepShape {
+    service: String,
+    command: Vec<String>,
+    #[serde(default)]
+    no_deps: bool,
+}
+
+/// A one-shot command the list allows around an update: `docker compose run --rm` of one
+/// service, with a fixed command. Nothing in a request can change it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub service: String,
+    pub command: Vec<String>,
+    /// `--no-deps`: don't start the services it depends on.
+    pub no_deps: bool,
+}
+
+/// Most arguments a step's command may have, and the longest one.
+const MAX_STEP_ARGS: usize = 16;
+const MAX_STEP_ARG: usize = 256;
 
 /// The checked allow-list.
 #[derive(Debug)]
@@ -77,17 +119,32 @@ pub struct Stack {
     /// The project name, when the list names one.
     pub project: Option<String>,
     pub services: Vec<String>,
-    /// The repository it may pull (`ghcr.io/snds/lockdown-server`), without a tag.
-    pub repository: String,
+    /// The repositories it may pull (`ghcr.io/snds/lockdown-server`), without a tag. One for
+    /// most stacks; several are pulled, checked and started together.
+    pub repositories: Vec<String>,
     /// The tag `compose.yaml` names (`main`). A pulled version is tagged as this locally, so
     /// compose starts it.
     pub compose_tag: String,
     pub tags: Vec<String>,
     pub main_versions: bool,
+    /// Runs after every image is checked, before anything is recreated. If it fails, nothing is.
+    pub before: Option<Step>,
+    /// Runs once the services are up; its result is reported, nothing is undone.
+    pub after: Option<Step>,
     pub key: Key,
 }
 
 impl Stack {
+    /// The first repository: the one a one-image stack's replies name.
+    pub fn repository(&self) -> &str {
+        &self.repositories[0]
+    }
+
+    /// Whether this stack updates several images together.
+    pub fn several_images(&self) -> bool {
+        self.repositories.len() > 1
+    }
+
     /// Whether `tag` may be pulled for this stack.
     pub fn allows_tag(&self, tag: &str) -> bool {
         protocol::valid_tag(tag)
@@ -162,11 +219,28 @@ impl AllowList {
                     return err(at(&format!("the service name {svc:?} isn't allowed.")));
                 }
             }
-            if !protocol::valid_repository(&s.image) {
-                return err(at(
-                    "`image` must be a repository on a registry, without a tag, like ghcr.io/snds/lockdown-server.",
-                ));
+            let repositories = match (s.image, s.images) {
+                (Some(one), None) => vec![one],
+                (None, Some(many)) if !many.is_empty() => many,
+                (None, Some(_)) => return err(at("`images` names no images.")),
+                (None, None) => return err(at("it needs `image` (or `images` for several).")),
+                (Some(_), Some(_)) => return err(at("use `image` or `images`, not both.")),
+            };
+            for (i, repo) in repositories.iter().enumerate() {
+                if !protocol::valid_repository(repo) {
+                    return err(at(
+                        "`image` must be a repository on a registry, without a tag, like ghcr.io/snds/lockdown-server.",
+                    ));
+                }
+                if repositories[..i].contains(repo) {
+                    return err(at(&format!("the image {repo:?} is named twice.")));
+                }
             }
+            let before = s
+                .before
+                .map(|b| check_step(&name, "before", b))
+                .transpose()?;
+            let after = s.after.map(|a| check_step(&name, "after", a)).transpose()?;
             let compose_tag = s.compose_tag.unwrap_or_else(|| "main".into());
             if !protocol::valid_tag(&compose_tag) {
                 return err(at("`compose_tag` isn't a valid tag."));
@@ -210,10 +284,12 @@ impl AllowList {
                     compose_files,
                     project: s.project,
                     services: s.services,
-                    repository: s.image,
+                    repositories,
                     compose_tag,
                     tags,
                     main_versions: s.main_versions.unwrap_or(true),
+                    before,
+                    after,
                     key,
                 },
             );
@@ -224,6 +300,36 @@ impl AllowList {
             stacks,
         })
     }
+}
+
+fn check_step(stack: &str, which: &str, s: StepShape) -> Result<Step, ListError> {
+    let at = |what: &str| format!("Stack {stack:?}, `{which}`: {what}");
+    if !protocol::valid_name(&s.service) {
+        return err(at(&format!(
+            "the service name {:?} isn't allowed.",
+            s.service
+        )));
+    }
+    if s.command.is_empty() || s.command.len() > MAX_STEP_ARGS {
+        return err(at(&format!(
+            "`command` needs 1 to {MAX_STEP_ARGS} arguments."
+        )));
+    }
+    if s.command[0].starts_with('-') {
+        return err(at("`command` must start with a program, not an option."));
+    }
+    for arg in &s.command {
+        if arg.is_empty() || arg.len() > MAX_STEP_ARG || arg.chars().any(char::is_control) {
+            return err(at(&format!(
+                "the argument {arg:?} must be 1 to {MAX_STEP_ARG} characters, without control characters."
+            )));
+        }
+    }
+    Ok(Step {
+        service: s.service,
+        command: s.command,
+        no_deps: s.no_deps,
+    })
 }
 
 fn check_listen(addr: &str) -> Result<(), ListError> {
@@ -305,7 +411,9 @@ compose_files = ["compose.yaml", "compose.override.yaml"]
 
     fn keys(stack: &str, path: &Path) -> Result<Key, ListError> {
         assert!(path.ends_with(format!("{stack}.key")));
-        let byte = stack.len() as u8;
+        let byte = stack
+            .bytes()
+            .fold(7u8, |a, b| a.wrapping_mul(31).wrapping_add(b));
         Key::parse(&format!("{byte:02x}").repeat(32)).map_err(|e| ListError(e.to_string()))
     }
 
@@ -384,9 +492,100 @@ compose_files = ["compose.yaml", "compose.override.yaml"]
         assert_eq!(list.listen, ["0.0.0.0:7480"]);
         assert_eq!(list.stacks["lockdown"].services, ["lockdown"]);
         assert_eq!(
-            list.stacks["vale-gateway"].repository,
+            list.stacks["vale-gateway"].repository(),
             "ghcr.io/snds/vale-gateway"
         );
+        let w = &list.stacks["warpcore"];
+        assert_eq!(w.services, ["web", "api", "sandbox"]);
+        assert_eq!(w.repositories.len(), 3);
+        assert!(w.before.is_some() && w.after.is_some());
+    }
+
+    const SEVERAL: &str = r#"
+listen = ["0.0.0.0:7480"]
+keys_dir = "/config/keys"
+
+[stack.warpcore]
+directory = "/mnt/user/appdata/warpcore/src/deploy"
+services = ["web", "api", "sandbox"]
+images = ["ghcr.io/snds/warpcore-web", "ghcr.io/snds/warpcore-api", "ghcr.io/snds/warpcore-sandbox"]
+before = { service = "backup", command = ["sh", "/backup/backup.sh", "once"] }
+after = { service = "sandbox", command = ["node", "dist/selftest.js"], no_deps = true }
+"#;
+
+    #[test]
+    fn a_stack_with_several_images_and_steps() {
+        let list = parse(SEVERAL).unwrap();
+        let w = &list.stacks["warpcore"];
+        assert!(w.several_images());
+        assert_eq!(w.repository(), "ghcr.io/snds/warpcore-web");
+        assert_eq!(w.repositories.len(), 3);
+        let before = w.before.as_ref().unwrap();
+        assert_eq!(before.service, "backup");
+        assert_eq!(before.command, ["sh", "/backup/backup.sh", "once"]);
+        assert!(!before.no_deps);
+        assert!(w.after.as_ref().unwrap().no_deps);
+        assert!(!parse(GOOD).unwrap().stacks["lockdown"].several_images());
+    }
+
+    #[test]
+    fn odd_images_or_steps_stop_it_starting() {
+        let images = "images = [\"ghcr.io/snds/warpcore-web\", \"ghcr.io/snds/warpcore-api\", \"ghcr.io/snds/warpcore-sandbox\"]";
+        let before = "before = { service = \"backup\", command = [\"sh\", \"/backup/backup.sh\", \"once\"] }";
+        let cases: &[(&str, &str, &str)] = &[
+            (images, "images = []", "names no images"),
+            (images, "", "needs `image`"),
+            (
+                images,
+                "images = [\"ghcr.io/snds/a\"]\nimage = \"ghcr.io/snds/b\"",
+                "not both",
+            ),
+            (
+                images,
+                "images = [\"ghcr.io/snds/a\", \"ghcr.io/snds/a\"]",
+                "named twice",
+            ),
+            (
+                images,
+                "images = [\"ghcr.io/snds/a:main\"]",
+                "without a tag",
+            ),
+            (
+                before,
+                "before = { service = \"--all\", command = [\"sh\"] }",
+                "isn't allowed",
+            ),
+            (
+                before,
+                "before = { service = \"backup\", command = [] }",
+                "1 to 16",
+            ),
+            (
+                before,
+                "before = { service = \"backup\", command = [\"--privileged\"] }",
+                "not an option",
+            ),
+            (
+                before,
+                "before = { service = \"backup\", command = [\"sh\", \"a\\nb\"] }",
+                "control characters",
+            ),
+            (
+                before,
+                "before = { service = \"backup\", command = [\"sh\", \"\"] }",
+                "1 to 256",
+            ),
+            (
+                before,
+                "before = { service = \"backup\", command = [\"sh\"], user = \"root\" }",
+                "unknown field",
+            ),
+        ];
+        for (from, to, says) in cases {
+            assert!(SEVERAL.contains(from), "{from}");
+            let e = parse(&SEVERAL.replacen(from, to, 1)).unwrap_err();
+            assert!(e.0.contains(says), "{to}: {}", e.0);
+        }
     }
 
     #[test]
