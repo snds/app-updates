@@ -9,6 +9,7 @@
 //! let done = helper.update(&UpdateRequest {
 //!     tag: Some("0.1.0-main.20261108093000".into()),
 //!     expect_digest: None,
+//!     ..Default::default()
 //! })?;
 //! # Ok::<(), host_helper::ClientError>(())
 //! ```

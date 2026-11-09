@@ -34,3 +34,25 @@ image = "ghcr.io/snds/vale-gateway"
 compose_tag = "main"
 tags = ["main"]
 main_versions = true
+
+[stack.warpcore]
+# Warpcore's deploy folder: compose.yaml is here.
+directory = "/mnt/user/appdata/warpcore/src/deploy"
+# web, api and sandbox only: never db or backup.
+services = ["web", "api", "sandbox"]
+# Three images, updated together. Each update names a version (x.y.z-main.<time>)
+# and every image's digest; all three are pulled and checked before anything
+# is recreated.
+images = [
+  "ghcr.io/snds/warpcore-web",
+  "ghcr.io/snds/warpcore-api",
+  "ghcr.io/snds/warpcore-sandbox",
+]
+compose_tag = "main"
+tags = ["main"]
+main_versions = true
+# A backup before anything is recreated. If it fails, nothing is.
+before = { service = "backup", command = ["sh", "/backup/backup.sh", "once"] }
+# The sandbox self-test once the new containers are up. Its result is reported;
+# nothing is rolled back (migrations make that unsafe).
+after = { service = "sandbox", command = ["node", "dist/selftest.js"], no_deps = true }

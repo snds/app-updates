@@ -2,14 +2,15 @@
 
 #![cfg(feature = "server")]
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use host_helper::allow::{AllowList, ListError, Stack};
-use host_helper::docker::{Container, Docker, DockerError, ImageInfo};
+use host_helper::allow::{AllowList, ListError, Stack, Step};
+use host_helper::docker::{Container, Docker, DockerError, ImageInfo, RunOutput};
 use host_helper::protocol::{self, H_NONCE, H_SIGNATURE, H_STACK, H_TIME, Key};
 use host_helper::server::Helper;
 use host_helper::{Client, ClientError, UpdateRequest};
@@ -27,10 +28,36 @@ image = "ghcr.io/snds/lockdown-server"
 directory = "/mnt/user/appdata/vale-gateway"
 services = ["gateway"]
 image = "ghcr.io/snds/vale-gateway"
+
+[stack.warpcore]
+directory = "/mnt/user/appdata/warpcore/src/deploy"
+services = ["web", "api", "sandbox"]
+images = ["ghcr.io/snds/warpcore-web", "ghcr.io/snds/warpcore-api", "ghcr.io/snds/warpcore-sandbox"]
+before = { service = "backup", command = ["sh", "/backup/backup.sh", "once"] }
+after = { service = "sandbox", command = ["node", "dist/selftest.js"], no_deps = true }
 "#;
 
+const WARPCORE: [&str; 3] = [
+    "ghcr.io/snds/warpcore-web",
+    "ghcr.io/snds/warpcore-api",
+    "ghcr.io/snds/warpcore-sandbox",
+];
+
+/// Warpcore's three repositories, each with its own digest ('c', 'd', 'e').
+fn warpcore_digests() -> BTreeMap<String, String> {
+    WARPCORE
+        .iter()
+        .zip(['c', 'd', 'e'])
+        .map(|(r, c)| (r.to_string(), digest(c)))
+        .collect()
+}
+
 fn key_of(stack: &str) -> Key {
-    let byte = if stack == "lockdown" { "1a" } else { "2b" };
+    let byte = match stack {
+        "lockdown" => "1a",
+        "vale" => "2b",
+        _ => "3c",
+    };
     Key::parse(&byte.repeat(32)).unwrap()
 }
 
@@ -45,6 +72,10 @@ struct Fake {
     pulled: Mutex<String>,
     /// When set, compose_up waits for a message before returning.
     hold: Mutex<Option<mpsc::Receiver<()>>>,
+    /// Per-repository digests, overriding `pulled`.
+    digests: Mutex<HashMap<String, String>>,
+    /// Exit status of a one-shot run, per service (0 when unset).
+    exits: Mutex<HashMap<String, i32>>,
 }
 
 #[derive(Clone, Default)]
@@ -71,8 +102,16 @@ impl Docker for FakeDocker {
             Some((repo, _)) if repo.starts_with("ghcr.io/") => repo,
             _ => "ghcr.io/snds/lockdown-server",
         };
+        let d = self
+            .0
+            .digests
+            .lock()
+            .unwrap()
+            .get(repo)
+            .cloned()
+            .unwrap_or_else(|| self.0.pulled.lock().unwrap().clone());
         Ok(ImageInfo {
-            repo_digests: vec![format!("{repo}@{}", self.0.pulled.lock().unwrap())],
+            repo_digests: vec![format!("{repo}@{d}")],
             version: Some("0.1.0-main.20261108093000".into()),
         })
     }
@@ -92,11 +131,32 @@ impl Docker for FakeDocker {
         self.record(format!("restart {} {}", stack.name, services.join(",")));
         Ok(())
     }
+    fn compose_run(&self, stack: &Stack, step: &Step) -> Result<RunOutput, DockerError> {
+        self.record(format!(
+            "run {} {}{} {}",
+            stack.name,
+            step.service,
+            if step.no_deps { " no-deps" } else { "" },
+            step.command.join(" ")
+        ));
+        let code = self
+            .0
+            .exits
+            .lock()
+            .unwrap()
+            .get(&step.service)
+            .copied()
+            .unwrap_or(0);
+        Ok(RunOutput {
+            exit_code: Some(code),
+            output: format!("{} said {code}", step.service),
+        })
+    }
     fn containers(&self, stack: &Stack, service: &str) -> Result<Vec<Container>, DockerError> {
         self.record(format!("ps {} {service}", stack.name));
         Ok(vec![Container {
             state: "running".into(),
-            config_image: format!("{}:main", stack.repository),
+            config_image: format!("{}:main", stack.repository()),
             image_id: "sha256:local".into(),
         }])
     }
@@ -115,6 +175,7 @@ fn start() -> Running {
     .unwrap();
     let docker = FakeDocker::default();
     *docker.0.pulled.lock().unwrap() = digest('a');
+    docker.0.digests.lock().unwrap().extend(warpcore_digests());
     let log = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&log);
     let helper = Arc::new(Helper::new(list, docker.clone()).with_clock_and_log(
@@ -218,6 +279,7 @@ fn update_pulls_checks_the_digest_and_recreates_only_the_allowed_service() {
         .update(&UpdateRequest {
             tag: Some(tag.into()),
             expect_digest: Some(digest('a')),
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(done.pulled, format!("ghcr.io/snds/lockdown-server:{tag}"));
@@ -266,6 +328,7 @@ fn a_different_digest_restarts_nothing() {
             .update(&UpdateRequest {
                 tag: None,
                 expect_digest: Some(digest('b')),
+                ..Default::default()
             })
             .unwrap_err(),
     );
@@ -288,6 +351,7 @@ fn tags_outside_the_list_are_refused_before_any_pull() {
                 .update(&UpdateRequest {
                     tag: Some(tag.into()),
                     expect_digest: None,
+                    ..Default::default()
                 })
                 .unwrap_err(),
         );
@@ -299,6 +363,7 @@ fn tags_outside_the_list_are_refused_before_any_pull() {
             .update(&UpdateRequest {
                 tag: None,
                 expect_digest: Some("sha256:short".into()),
+                ..Default::default()
             })
             .unwrap_err(),
     );
@@ -324,7 +389,7 @@ fn a_wrong_key_or_another_stacks_name_does_nothing() {
     let borrowed = Client::new(&r.url, "lockdown", key_of("vale")).unwrap();
     let (status, _, _) = refused(borrowed.restart().unwrap_err());
     assert_eq!(status, 401);
-    let unknown = Client::new(&r.url, "warpcore", key_of("vale")).unwrap();
+    let unknown = Client::new(&r.url, "media", key_of("vale")).unwrap();
     let (_, code, _) = refused(unknown.status().unwrap_err());
     assert_eq!(code, "unknown_stack");
     assert!(r.docker.calls().is_empty());
@@ -489,4 +554,242 @@ fn an_unreachable_helper_says_so() {
         .unwrap_err();
     assert!(matches!(e, ClientError::Unreachable(_)));
     assert!(e.to_string().contains("can't be reached"));
+}
+
+const WC_TAG: &str = "0.4.0-main.20261109010000";
+
+fn warpcore_update() -> UpdateRequest {
+    UpdateRequest {
+        tag: Some(WC_TAG.into()),
+        expect_digests: Some(warpcore_digests()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn several_images_are_pulled_and_checked_then_started_together() {
+    let r = start();
+    let done = client(&r, "warpcore").update(&warpcore_update()).unwrap();
+    assert_eq!(done.services, ["web", "api", "sandbox"]);
+    assert_eq!(done.images.len(), 3);
+    assert_eq!(
+        done.images[1].pulled,
+        format!("ghcr.io/snds/warpcore-api:{WC_TAG}")
+    );
+    assert_eq!(done.images[1].digest, digest('d'));
+    assert_eq!(done.before.as_ref().unwrap().exit_code, Some(0));
+    let after = done.after.unwrap();
+    assert!(after.ok);
+    assert_eq!(after.service, "sandbox");
+    assert_eq!(after.output, "sandbox said 0");
+    let mut want: Vec<String> = WARPCORE
+        .iter()
+        .map(|r| format!("pull {r}:{WC_TAG}"))
+        .collect();
+    want.extend(WARPCORE.iter().map(|r| format!("image {r}:{WC_TAG}")));
+    want.push("run warpcore backup sh /backup/backup.sh once".into());
+    for (repo, c) in WARPCORE.iter().zip(['c', 'd', 'e']) {
+        want.push(format!("tag {repo}@{} {repo}:main", digest(c)));
+    }
+    want.push("up warpcore web,api,sandbox".into());
+    want.push("run warpcore sandbox no-deps node dist/selftest.js".into());
+    assert_eq!(r.docker.calls(), want);
+
+    let status = client(&r, "warpcore").status().unwrap();
+    assert_eq!(status.repositories, WARPCORE);
+    assert!(status.progress.running.is_none());
+    let last = status.progress.last.unwrap();
+    assert!(last.ok && last.failed_step.is_none());
+    assert_eq!(last.operation, "update");
+    assert!(last.after.unwrap().ok);
+}
+
+#[test]
+fn one_wrong_digest_among_several_starts_nothing() {
+    let r = start();
+    r.docker
+        .0
+        .digests
+        .lock()
+        .unwrap()
+        .insert(WARPCORE[2].into(), digest('f'));
+    let (status, code, message) = refused(
+        client(&r, "warpcore")
+            .update(&warpcore_update())
+            .unwrap_err(),
+    );
+    assert_eq!((status, code.as_str()), (409, "digest_mismatch"));
+    assert!(message.contains("warpcore-sandbox") && message.contains("Nothing was restarted"));
+    assert!(
+        !r.docker
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("run") || c.starts_with("tag") || c.starts_with("up"))
+    );
+    let last = client(&r, "warpcore")
+        .status()
+        .unwrap()
+        .progress
+        .last
+        .unwrap();
+    assert!(!last.ok);
+    assert_eq!(last.failed_step.as_deref(), Some("check"));
+    assert_eq!(last.error.unwrap().error, "digest_mismatch");
+}
+
+#[test]
+fn a_failed_before_step_starts_nothing() {
+    let r = start();
+    r.docker.0.exits.lock().unwrap().insert("backup".into(), 2);
+    let (status, code, message) = refused(
+        client(&r, "warpcore")
+            .update(&warpcore_update())
+            .unwrap_err(),
+    );
+    assert_eq!((status, code.as_str()), (502, "before_failed"));
+    assert!(
+        message.contains("exited with 2") && message.contains("backup said 2"),
+        "{message}"
+    );
+    let calls = r.docker.calls();
+    assert!(calls.last().unwrap().starts_with("run warpcore backup"));
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("tag") || c.starts_with("up"))
+    );
+    let last = client(&r, "warpcore")
+        .status()
+        .unwrap()
+        .progress
+        .last
+        .unwrap();
+    assert_eq!(last.failed_step.as_deref(), Some("before"));
+}
+
+#[test]
+fn a_failed_after_step_is_reported_not_undone() {
+    let r = start();
+    r.docker.0.exits.lock().unwrap().insert("sandbox".into(), 3);
+    let done = client(&r, "warpcore").update(&warpcore_update()).unwrap();
+    let after = done.after.unwrap();
+    assert!(!after.ok);
+    assert_eq!(after.exit_code, Some(3));
+    assert_eq!(after.output, "sandbox said 3");
+    // The services were started, and nothing ran after the self-test.
+    let calls = r.docker.calls();
+    assert!(calls.contains(&"up warpcore web,api,sandbox".to_owned()));
+    assert!(calls.last().unwrap().starts_with("run warpcore sandbox"));
+    let last = client(&r, "warpcore")
+        .status()
+        .unwrap()
+        .progress
+        .last
+        .unwrap();
+    assert!(last.ok);
+    assert_eq!(last.after.unwrap().exit_code, Some(3));
+}
+
+#[test]
+fn several_images_need_a_version_and_every_digest() {
+    let r = start();
+    let wc = client(&r, "warpcore");
+    let main = UpdateRequest {
+        tag: None,
+        ..warpcore_update()
+    };
+    let (status, code, message) = refused(wc.update(&main).unwrap_err());
+    assert_eq!((status, code.as_str()), (403, "tag_not_allowed"));
+    assert!(message.contains("version tag"), "{message}");
+
+    let none = UpdateRequest {
+        expect_digests: None,
+        ..warpcore_update()
+    };
+    assert_eq!(refused(wc.update(&none).unwrap_err()).1, "digests_required");
+
+    let mut short = warpcore_digests();
+    short.remove(WARPCORE[0]);
+    let missing = UpdateRequest {
+        expect_digests: Some(short),
+        ..warpcore_update()
+    };
+    assert_eq!(refused(wc.update(&missing).unwrap_err()).1, "bad_digests");
+
+    let mut extra = warpcore_digests();
+    extra.insert("ghcr.io/snds/lockdown-server".into(), digest('a'));
+    let extra = UpdateRequest {
+        expect_digests: Some(extra),
+        ..warpcore_update()
+    };
+    assert_eq!(refused(wc.update(&extra).unwrap_err()).1, "bad_digests");
+
+    let one = UpdateRequest {
+        expect_digest: Some(digest('c')),
+        ..warpcore_update()
+    };
+    assert_eq!(refused(wc.update(&one).unwrap_err()).1, "bad_request");
+
+    let mut bad = warpcore_digests();
+    bad.insert(WARPCORE[1].into(), "sha256:short".into());
+    let bad = UpdateRequest {
+        expect_digests: Some(bad),
+        ..warpcore_update()
+    };
+    assert_eq!(refused(wc.update(&bad).unwrap_err()).1, "bad_digest");
+
+    assert!(r.docker.calls().is_empty());
+}
+
+#[test]
+fn a_one_image_stack_also_takes_its_digest_by_repository() {
+    let r = start();
+    let ld = client(&r, "lockdown");
+    let by_repo = UpdateRequest {
+        expect_digests: Some(BTreeMap::from([(
+            "ghcr.io/snds/lockdown-server".to_owned(),
+            digest('b'),
+        )])),
+        ..Default::default()
+    };
+    assert_eq!(
+        refused(ld.update(&by_repo).unwrap_err()).1,
+        "digest_mismatch"
+    );
+    let other = UpdateRequest {
+        expect_digests: Some(BTreeMap::from([(WARPCORE[0].to_owned(), digest('a'))])),
+        ..Default::default()
+    };
+    assert_eq!(refused(ld.update(&other).unwrap_err()).1, "bad_digests");
+}
+
+#[test]
+fn status_shows_the_step_an_update_is_on() {
+    let r = start();
+    let (tx, rx) = mpsc::channel();
+    *r.docker.0.hold.lock().unwrap() = Some(rx);
+    let url = r.url.clone();
+    let worker = std::thread::spawn(move || {
+        Client::new(&url, "warpcore", key_of("warpcore"))
+            .unwrap()
+            .update(&warpcore_update())
+    });
+    let wc = client(&r, "warpcore");
+    let mut seen = None;
+    for _ in 0..200 {
+        let p = wc.status().unwrap().progress;
+        if let Some(running) = p.running
+            && running.step == "recreate"
+        {
+            seen = Some(running);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let running = seen.expect("status never showed the recreate step");
+    assert_eq!(running.operation, "update");
+    tx.send(()).unwrap();
+    assert!(worker.join().unwrap().is_ok());
+    let p = wc.status().unwrap().progress;
+    assert!(p.running.is_none() && p.last.unwrap().ok);
 }

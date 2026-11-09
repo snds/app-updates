@@ -15,8 +15,9 @@ use crate::allow::{AllowList, Stack};
 use crate::docker::{self, Docker};
 use crate::http::{self, Message, ReadError};
 use crate::protocol::{
-    self, ErrorReply, H_NONCE, H_SIGNATURE, H_STACK, H_TIME, MAX_BODY, MAX_SKEW_SECS, Operation,
-    RestartReply, ServiceStatus, StatusReply, UpdateReply, UpdateRequest,
+    self, ErrorReply, Finished, H_NONCE, H_SIGNATURE, H_STACK, H_TIME, MAX_BODY, MAX_SKEW_SECS,
+    Operation, Progress, PulledImage, RestartReply, Running, ServiceStatus, StatusReply,
+    StepReport, UpdateReply, UpdateRequest, step,
 };
 
 /// Signed requests one stack may make in a minute.
@@ -44,6 +45,20 @@ struct StackState {
     busy: Mutex<()>,
     nonces: Mutex<HashMap<String, u64>>,
     recent: Mutex<VecDeque<u64>>,
+    /// Read by `status` while a change runs, so it never waits on `busy`.
+    progress: Mutex<Progress>,
+}
+
+impl StackState {
+    fn progress(&self) -> std::sync::MutexGuard<'_, Progress> {
+        self.progress.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn at(&self, step: &str) {
+        if let Some(r) = self.progress().running.as_mut() {
+            r.step = step.to_owned();
+        }
+    }
 }
 
 /// The helper's state: the list, Docker, and the counters.
@@ -264,7 +279,7 @@ impl<D: Docker> Helper<D> {
             recent.push_back(now);
         }
         let reply = match op {
-            Operation::Status => self.status(stack),
+            Operation::Status => self.status(stack, state),
             Operation::Update | Operation::Restart => {
                 let Ok(_guard) = state.busy.try_lock() else {
                     return signed(refuse(
@@ -276,17 +291,48 @@ impl<D: Docker> Helper<D> {
                         ),
                     ));
                 };
-                if op == Operation::Update {
-                    self.update(stack, &req.body)
+                let first = if op == Operation::Update {
+                    step::REQUEST
+                } else {
+                    step::RESTART
+                };
+                state.progress().running = Some(Running {
+                    operation: op.name().into(),
+                    step: first.into(),
+                    started: now,
+                });
+                let reply = if op == Operation::Update {
+                    self.update(stack, &req.body, &|s: &str| state.at(s))
                 } else {
                     self.restart(stack)
-                }
+                };
+                let mut progress = state.progress();
+                let running = progress.running.take();
+                let error = (reply.status != 200)
+                    .then(|| serde_json::from_slice::<ErrorReply>(&reply.body).ok())
+                    .flatten();
+                let after = (reply.status == 200 && op == Operation::Update)
+                    .then(|| serde_json::from_slice::<UpdateReply>(&reply.body).ok())
+                    .flatten()
+                    .and_then(|u| u.after);
+                progress.last = Some(Finished {
+                    operation: op.name().into(),
+                    started: now,
+                    finished: (self.clock)(),
+                    ok: reply.status == 200,
+                    failed_step: (reply.status != 200)
+                        .then(|| running.map(|r| r.step))
+                        .flatten(),
+                    error,
+                    after,
+                });
+                reply
             }
         };
         signed(reply)
     }
 
-    fn status(&self, stack: &Stack) -> Reply {
+    fn status(&self, stack: &Stack, state: &StackState) -> Reply {
         let mut services = Vec::new();
         for svc in &stack.services {
             let containers = match self.docker.containers(stack, svc) {
@@ -308,19 +354,27 @@ impl<D: Docker> Helper<D> {
                     service: svc.clone(),
                     state: c.state,
                     image: Some(c.config_image),
-                    digest: docker::digest_for(&info, &stack.repository),
+                    digest: stack
+                        .repositories
+                        .iter()
+                        .find_map(|r| docker::digest_for(&info, r)),
                     version: info.version,
                 });
             }
         }
         ok(&StatusReply {
             stack: stack.name.clone(),
-            repository: stack.repository.clone(),
+            repository: stack.repository().to_owned(),
+            repositories: stack.repositories.clone(),
             services,
+            progress: state.progress().clone(),
         })
     }
 
-    fn update(&self, stack: &Stack, body: &[u8]) -> Reply {
+    /// Pulls every image and checks every digest, runs `before`, then points compose's tag
+    /// at the pulled builds and recreates the services together, then runs `after`. Nothing is
+    /// recreated unless every pull, every check and `before` passed. `at` names each step.
+    fn update(&self, stack: &Stack, body: &[u8], at: &dyn Fn(&str)) -> Reply {
         let req: UpdateRequest = if body.iter().all(u8::is_ascii_whitespace) {
             UpdateRequest::default()
         } else {
@@ -330,7 +384,7 @@ impl<D: Docker> Helper<D> {
                     return refuse(
                         400,
                         "bad_request",
-                        "The update request couldn't be read: it takes only `tag` and `expect_digest`.",
+                        "The update request couldn't be read: it takes only `tag`, `expect_digest` and `expect_digests`.",
                     );
                 }
             }
@@ -347,61 +401,130 @@ impl<D: Docker> Helper<D> {
                 ),
             );
         }
-        if let Some(d) = &req.expect_digest
-            && !protocol::valid_digest(d)
-        {
-            return refuse(
-                400,
-                "bad_digest",
-                "The expected digest must be sha256: and 64 hex characters.",
-            );
-        }
-        let reference = format!("{}:{tag}", stack.repository);
-        if let Err(e) = self.docker.pull(&reference) {
-            return docker_failed(&format!("pull {reference}"), &e);
-        }
-        let info = match self.docker.image(&reference) {
-            Ok(i) => i,
-            Err(e) => return docker_failed("read the pulled image", &e),
+        let expected = match expected_digests(stack, &tag, req.expect_digest, req.expect_digests) {
+            Ok(e) => e,
+            Err(r) => return r,
         };
-        let Some(digest) = docker::digest_for(&info, &stack.repository) else {
-            return refuse(
-                502,
-                "no_digest",
-                format!(
-                    "The pulled image has no digest from {}, so it wasn't used.",
-                    stack.repository
-                ),
-            );
-        };
-        if let Some(expected) = &req.expect_digest
-            && *expected != digest
-        {
-            return refuse(
-                409,
-                "digest_mismatch",
-                format!(
-                    "The pulled image isn't the expected build (it is {digest}, the release says {expected}). Nothing was restarted."
-                ),
-            );
+
+        at(step::PULL);
+        for repo in &stack.repositories {
+            let reference = format!("{repo}:{tag}");
+            if let Err(e) = self.docker.pull(&reference) {
+                return docker_failed(&format!("pull {reference}. Nothing was restarted"), &e);
+            }
         }
+
+        at(step::CHECK);
+        let mut images = Vec::new();
+        for (i, repo) in stack.repositories.iter().enumerate() {
+            let reference = format!("{repo}:{tag}");
+            let info = match self.docker.image(&reference) {
+                Ok(i) => i,
+                Err(e) => return docker_failed("read the pulled image. Nothing was restarted", &e),
+            };
+            let Some(digest) = docker::digest_for(&info, repo) else {
+                return refuse(
+                    502,
+                    "no_digest",
+                    format!(
+                        "The pulled image has no digest from {repo}, so it wasn't used. Nothing was restarted."
+                    ),
+                );
+            };
+            if let Some(want) = &expected[i]
+                && *want != digest
+            {
+                return refuse(
+                    409,
+                    "digest_mismatch",
+                    format!(
+                        "The pulled image {reference} isn't the expected build (it is {digest}, the release says {want}). Nothing was restarted."
+                    ),
+                );
+            }
+            images.push(PulledImage {
+                pulled: reference,
+                digest,
+            });
+        }
+
+        let mut before = None;
+        if let Some(b) = &stack.before {
+            at(step::BEFORE);
+            let report = match self.docker.compose_run(stack, b) {
+                Ok(out) => report(b, out),
+                Err(e) => {
+                    return docker_failed(
+                        &format!(
+                            "run the `before` step ({}). Nothing was restarted",
+                            b.service
+                        ),
+                        &e,
+                    );
+                }
+            };
+            if !report.ok {
+                let code = report
+                    .exit_code
+                    .map_or("was stopped".to_owned(), |c| format!("exited with {c}"));
+                return refuse(
+                    502,
+                    "before_failed",
+                    format!(
+                        "The `before` step ({}) {code}, so nothing was restarted. Its last words: {}",
+                        b.service,
+                        last_line(&report.output)
+                    ),
+                );
+            }
+            before = Some(report);
+        }
+
+        at(step::TAG);
         if tag != stack.compose_tag {
             // compose.yaml names `<repository>:<compose_tag>`; point that at the pulled build
             // (by digest, so nothing pulled in between can slip in).
-            let pinned = format!("{}@{digest}", stack.repository);
-            let target = format!("{}:{}", stack.repository, stack.compose_tag);
-            if let Err(e) = self.docker.tag(&pinned, &target) {
-                return docker_failed("tag the pulled image", &e);
+            for (repo, img) in stack.repositories.iter().zip(&images) {
+                let pinned = format!("{repo}@{}", img.digest);
+                let target = format!("{repo}:{}", stack.compose_tag);
+                if let Err(e) = self.docker.tag(&pinned, &target) {
+                    return docker_failed("tag the pulled image", &e);
+                }
             }
         }
+
+        at(step::RECREATE);
         if let Err(e) = self.docker.compose_up(stack, &stack.services) {
             return docker_failed("start the new containers", &e);
         }
+
+        let mut after = None;
+        if let Some(a) = &stack.after {
+            at(step::AFTER);
+            after = Some(match self.docker.compose_run(stack, a) {
+                Ok(out) => report(a, out),
+                Err(e) => StepReport {
+                    service: a.service.clone(),
+                    exit_code: None,
+                    ok: false,
+                    output: e.0,
+                },
+            });
+        }
+
+        let first = images[0].clone();
         ok(&UpdateReply {
             stack: stack.name.clone(),
-            pulled: reference,
-            digest,
+            pulled: first.pulled,
+            digest: first.digest,
             services: stack.services.clone(),
+            images: if stack.several_images() {
+                images
+            } else {
+                Vec::new()
+            },
+            before,
+            after,
         })
     }
 
@@ -447,6 +570,114 @@ impl<D: Docker> Helper<D> {
         }
         let _ = http::write_reply(stream, reply.status, &headers, &reply.body);
     }
+}
+
+/// Each repository's expected digest, in the stack's order, from either request field.
+///
+/// A stack with several images must be updated to a version tag (so `compose_tag`, which
+/// compose starts, changes only after every image passed) and with a digest for each image.
+fn expected_digests(
+    stack: &Stack,
+    tag: &str,
+    one: Option<String>,
+    many: Option<BTreeMap<String, String>>,
+) -> Result<Vec<Option<String>>, Reply> {
+    let bad_digest = || {
+        refuse(
+            400,
+            "bad_digest",
+            "An expected digest must be sha256: and 64 hex characters.",
+        )
+    };
+    let wrong_set = || {
+        refuse(
+            400,
+            "bad_digests",
+            format!(
+                "`expect_digests` must name exactly {}'s images: {}.",
+                stack.name,
+                stack.repositories.join(", ")
+            ),
+        )
+    };
+    if !stack.several_images() {
+        let want = match (one, many) {
+            (Some(_), Some(_)) => {
+                return Err(refuse(
+                    400,
+                    "bad_request",
+                    "Send `expect_digest` or `expect_digests`, not both.",
+                ));
+            }
+            (d, None) => d,
+            (None, Some(mut m)) => {
+                let d = m.remove(stack.repository()).ok_or_else(wrong_set)?;
+                if !m.is_empty() {
+                    return Err(wrong_set());
+                }
+                Some(d)
+            }
+        };
+        if want.as_deref().is_some_and(|d| !protocol::valid_digest(d)) {
+            return Err(bad_digest());
+        }
+        return Ok(vec![want]);
+    }
+    if one.is_some() {
+        return Err(refuse(
+            400,
+            "bad_request",
+            format!(
+                "{} updates several images, so it takes `expect_digests` (one per image), not `expect_digest`.",
+                stack.name
+            ),
+        ));
+    }
+    if tag == stack.compose_tag {
+        return Err(refuse(
+            403,
+            "tag_not_allowed",
+            format!(
+                "{} updates several images together, so it needs a version tag (x.y.z-main.<time>), not {tag:?}: that way nothing compose starts changes until every image is checked.",
+                stack.name
+            ),
+        ));
+    }
+    let Some(mut many) = many else {
+        return Err(refuse(
+            400,
+            "digests_required",
+            format!(
+                "{} updates several images, so the request must give each one's digest in `expect_digests`.",
+                stack.name
+            ),
+        ));
+    };
+    let mut out = Vec::new();
+    for repo in &stack.repositories {
+        let d = many.remove(repo).ok_or_else(wrong_set)?;
+        if !protocol::valid_digest(&d) {
+            return Err(bad_digest());
+        }
+        out.push(Some(d));
+    }
+    if !many.is_empty() {
+        return Err(wrong_set());
+    }
+    Ok(out)
+}
+
+fn report(step: &crate::allow::Step, out: docker::RunOutput) -> StepReport {
+    StepReport {
+        service: step.service.clone(),
+        ok: out.exit_code == Some(0),
+        exit_code: out.exit_code,
+        output: out.output,
+    }
+}
+
+fn last_line(output: &str) -> &str {
+    output.lines().last().unwrap_or("(nothing)")
 }
 
 fn ok<T: serde::Serialize>(value: &T) -> Reply {

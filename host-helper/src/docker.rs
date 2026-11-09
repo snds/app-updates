@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::allow::Stack;
+use crate::allow::{Stack, Step};
 
 /// How long one `docker` call may run before it is stopped.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -32,6 +32,19 @@ pub struct ImageInfo {
     /// `org.opencontainers.image.version`, if set.
     pub version: Option<String>,
 }
+
+/// How a one-shot command ended: its exit status and the tail of its output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOutput {
+    /// None when it was stopped by a signal.
+    pub exit_code: Option<i32>,
+    /// The last [`OUTPUT_LINES`] lines of standard output and error, at most [`OUTPUT_BYTES`].
+    pub output: String,
+}
+
+/// How much of a step's output is kept.
+pub const OUTPUT_LINES: usize = 20;
+pub const OUTPUT_BYTES: usize = 4096;
 
 /// A failed Docker call: what was being done, and Docker's last words (no secrets: Docker's
 /// output never holds the helper's keys).
@@ -56,6 +69,10 @@ pub trait Docker: Send + Sync {
     fn compose_up(&self, stack: &Stack, services: &[String]) -> Result<(), DockerError>;
     /// `docker compose restart <services>` in the stack's folder.
     fn compose_restart(&self, stack: &Stack, services: &[String]) -> Result<(), DockerError>;
+    /// `docker compose run --rm -T [--no-deps] -- <service> <command…>` in the stack's folder.
+    /// A command that runs and fails is `Ok` with its exit status; `Err` means Docker itself
+    /// couldn't run it.
+    fn compose_run(&self, stack: &Stack, step: &Step) -> Result<RunOutput, DockerError>;
     /// The containers of one service.
     fn containers(&self, stack: &Stack, service: &str) -> Result<Vec<Container>, DockerError>;
 }
@@ -108,8 +125,62 @@ pub fn restart_args(stack: &Stack, services: &[String]) -> Vec<String> {
     args
 }
 
+/// `compose … run --rm --no-TTY --pull never [--no-deps] -- <service> <command…>`.
+pub fn run_args(stack: &Stack, step: &Step) -> Vec<String> {
+    let mut args = compose_args(stack);
+    args.extend(["run", "--rm", "--no-TTY", "--pull", "never"].map(str::to_owned));
+    if step.no_deps {
+        args.push("--no-deps".into());
+    }
+    args.push("--".into());
+    args.push(step.service.clone());
+    args.extend(step.command.iter().cloned());
+    args
+}
+
+/// The last lines of `stdout` and `stderr` together, trimmed to the limits.
+pub fn tail(stdout: &str, stderr: &str) -> String {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let mut out = lines[lines.len().saturating_sub(OUTPUT_LINES)..].join("\n");
+    if out.len() > OUTPUT_BYTES {
+        let mut cut = out.len() - OUTPUT_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut += 1;
+        }
+        out = out[cut..].to_owned();
+    }
+    out
+}
+
+struct Exit {
+    code: Option<i32>,
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
 impl Cli {
     fn run(&self, args: &[String], dir: Option<&PathBuf>) -> Result<String, DockerError> {
+        let what = args.iter().take(3).cloned().collect::<Vec<_>>().join(" ");
+        let exit = self.exec(args, dir)?;
+        if exit.success {
+            Ok(exit.stdout)
+        } else {
+            let tail: Vec<&str> = exit
+                .stderr
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let tail = tail[tail.len().saturating_sub(3)..].join(" / ");
+            Err(DockerError(format!("`docker {what}` failed: {tail}")))
+        }
+    }
+
+    fn exec(&self, args: &[String], dir: Option<&PathBuf>) -> Result<Exit, DockerError> {
         let mut cmd = Command::new(&self.program);
         cmd.args(args)
             .env_clear()
@@ -158,13 +229,12 @@ impl Cli {
         };
         let stdout = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
         let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
-        if status.success() {
-            Ok(stdout)
-        } else {
-            let tail: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-            let tail = tail[tail.len().saturating_sub(3)..].join(" / ");
-            Err(DockerError(format!("`docker {what}` failed: {tail}")))
-        }
+        Ok(Exit {
+            code: status.code(),
+            success: status.success(),
+            stdout,
+            stderr,
+        })
     }
 }
 
@@ -201,6 +271,14 @@ impl Docker for Cli {
     fn compose_restart(&self, stack: &Stack, services: &[String]) -> Result<(), DockerError> {
         self.run(&restart_args(stack, services), Some(&stack.directory))
             .map(drop)
+    }
+
+    fn compose_run(&self, stack: &Stack, step: &Step) -> Result<RunOutput, DockerError> {
+        let exit = self.exec(&run_args(stack, step), Some(&stack.directory))?;
+        Ok(RunOutput {
+            exit_code: exit.code,
+            output: tail(&exit.stdout, &exit.stderr),
+        })
     }
 
     fn containers(&self, stack: &Stack, service: &str) -> Result<Vec<Container>, DockerError> {
@@ -284,10 +362,12 @@ mod tests {
             compose_files: files.iter().map(|s| s.to_string()).collect(),
             project: project.map(String::from),
             services: vec!["lockdown".into()],
-            repository: "ghcr.io/snds/lockdown-server".into(),
+            repositories: vec!["ghcr.io/snds/lockdown-server".into()],
             compose_tag: "main".into(),
             tags: vec!["main".into()],
             main_versions: true,
+            before: None,
+            after: None,
             key: Key::parse(&"11".repeat(32)).unwrap(),
         }
     }
@@ -325,6 +405,44 @@ mod tests {
                 "lockdown"
             ]
         );
+    }
+
+    #[test]
+    fn run_arguments_and_output() {
+        let s = stack(None, &[]);
+        let step = Step {
+            service: "backup".into(),
+            command: vec!["sh".into(), "/backup/backup.sh".into(), "once".into()],
+            no_deps: false,
+        };
+        assert_eq!(
+            run_args(&s, &step),
+            [
+                "compose",
+                "run",
+                "--rm",
+                "--no-TTY",
+                "--pull",
+                "never",
+                "--",
+                "backup",
+                "sh",
+                "/backup/backup.sh",
+                "once"
+            ]
+        );
+        let step = Step {
+            no_deps: true,
+            ..step
+        };
+        assert!(run_args(&s, &step).contains(&"--no-deps".to_owned()));
+        let many: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let t = tail(&many, "boom\n");
+        assert_eq!(t.lines().count(), OUTPUT_LINES);
+        assert!(t.starts_with("line 12") && t.ends_with("boom"), "{t}");
+        let long = "é".repeat(5000);
+        let t = tail(&long, "");
+        assert!(t.len() <= OUTPUT_BYTES && t.chars().all(|c| c == 'é'));
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! A reply to a signed request carries `x-helper-signature` too, over [`reply_input`], so a
 //! server knows the answer came from the helper and belongs to its own request.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use hmac::{Hmac, Mac};
@@ -272,6 +273,10 @@ pub struct UpdateRequest {
     /// manifest. When given, any other digest is refused and nothing restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_digest: Option<String>,
+    /// For a stack with several images: each repository's expected digest. Required for such a
+    /// stack, and it must name every one of its repositories and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_digests: Option<BTreeMap<String, String>>,
 }
 
 /// One allowed service, as `status` reports it.
@@ -293,9 +298,88 @@ pub struct ServiceStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReply {
     pub stack: String,
-    /// The repository this stack may pull from.
+    /// The repository this stack may pull from (the first, for a stack with several).
     pub repository: String,
+    /// Every repository it may pull from. Empty from a helper older than this field.
+    #[serde(default)]
+    pub repositories: Vec<String>,
     pub services: Vec<ServiceStatus>,
+    /// What the helper is doing for this stack, and how its last change ended. Poll `status`
+    /// while an update runs to follow it.
+    #[serde(default)]
+    pub progress: Progress,
+}
+
+/// The steps of an update, in order, and the one step of a restart.
+pub mod step {
+    /// Reading and checking the request.
+    pub const REQUEST: &str = "request";
+    pub const PULL: &str = "pull";
+    pub const CHECK: &str = "check";
+    pub const BEFORE: &str = "before";
+    pub const TAG: &str = "tag";
+    pub const RECREATE: &str = "recreate";
+    pub const AFTER: &str = "after";
+    pub const RESTART: &str = "restart";
+}
+
+/// A stack's current and last change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// Set while an update or restart runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<Running>,
+    /// How the last update or restart ended, since the helper started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<Finished>,
+}
+
+/// A change in progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Running {
+    /// `update` or `restart`.
+    pub operation: String,
+    /// The step running now (see [`step`]).
+    pub step: String,
+    /// Unix seconds when the change started.
+    pub started: u64,
+}
+
+/// A change that ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finished {
+    pub operation: String,
+    pub started: u64,
+    pub finished: u64,
+    pub ok: bool,
+    /// The step it stopped at, when it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    /// The refusal's code and sentence, when it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorReply>,
+    /// The `after` step's result, when the stack has one and it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<StepReport>,
+}
+
+/// How a one-shot step ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepReport {
+    pub service: String,
+    /// The command's exit status; none when it was stopped by a signal.
+    pub exit_code: Option<i32>,
+    pub ok: bool,
+    /// The last lines of what it printed (standard output and error together).
+    pub output: String,
+}
+
+/// One image an update pulled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PulledImage {
+    /// `ghcr.io/snds/warpcore-api:0.1.0-main.20261108093000`.
+    pub pulled: String,
+    pub digest: String,
 }
 
 /// The reply to `update`.
@@ -308,6 +392,16 @@ pub struct UpdateReply {
     pub digest: String,
     /// The services recreated on it.
     pub services: Vec<String>,
+    /// Every image pulled, for a stack with several (`pulled` and `digest` are the first).
+    #[serde(default)]
+    pub images: Vec<PulledImage>,
+    /// The `before` step's result, when the stack has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<StepReport>,
+    /// The `after` step's result, when the stack has one. The update itself succeeded either
+    /// way: a failed `after` is reported, not undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<StepReport>,
 }
 
 /// The reply to `restart`.
@@ -463,5 +557,32 @@ mod tests {
         assert!(serde_json::from_str::<UpdateRequest>(r#"{"tag":"main","cmd":"rm"}"#).is_err());
         let r: UpdateRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(r, UpdateRequest::default());
+        // An old client's request still reads, and a new one without digests looks old.
+        let old: UpdateRequest =
+            serde_json::from_str(r#"{"tag":"main","expect_digest":"sha256:x"}"#).unwrap();
+        assert_eq!(old.expect_digests, None);
+        assert_eq!(
+            serde_json::to_string(&UpdateRequest {
+                tag: Some("main".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            r#"{"tag":"main"}"#
+        );
+    }
+
+    #[test]
+    fn replies_from_an_older_helper_still_read() {
+        let s: StatusReply = serde_json::from_str(
+            r#"{"stack":"lockdown","repository":"ghcr.io/snds/lockdown-server","services":[]}"#,
+        )
+        .unwrap();
+        assert!(s.repositories.is_empty());
+        assert_eq!(s.progress, Progress::default());
+        let u: UpdateReply = serde_json::from_str(
+            r#"{"stack":"lockdown","pulled":"x:main","digest":"sha256:a","services":["lockdown"]}"#,
+        )
+        .unwrap();
+        assert!(u.images.is_empty() && u.after.is_none());
     }
 }

@@ -92,9 +92,9 @@ fn check(args: &[String]) -> Result<(), String> {
     );
     for s in list.stacks.values() {
         println!(
-            "  {}: {} in {} (services {}; tags {}{})",
+            "  {}: {} in {} (services {}; tags {}{}){}{}",
             s.name,
-            s.repository,
+            s.repositories.join(" + "),
             s.directory.display(),
             s.services.join(", "),
             s.tags.join(", "),
@@ -102,7 +102,15 @@ fn check(args: &[String]) -> Result<(), String> {
                 ", main-channel versions"
             } else {
                 ""
-            }
+            },
+            s.before
+                .as_ref()
+                .map(|b| format!("; before: {} {}", b.service, b.command.join(" ")))
+                .unwrap_or_default(),
+            s.after
+                .as_ref()
+                .map(|a| format!("; after: {} {}", a.service, a.command.join(" ")))
+                .unwrap_or_default()
         );
     }
     Ok(())
@@ -231,6 +239,7 @@ fn call(args: &[String]) -> Result<(), String> {
                 .update(&UpdateRequest {
                     tag: get(&f, "tag").map(str::to_owned),
                     expect_digest: None,
+                    ..Default::default()
                 })
                 .map_err(|e| e.to_string())?,
         ),
