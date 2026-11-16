@@ -32,6 +32,9 @@ proposal, approved 2026-11-08 (U1–U6).
 snds-app-updates = { git = "https://github.com/snds/app-updates", tag = "v0.2.0", features = ["tauri"] }
 ```
 
+New versions tag themselves: once CI passes on `main`, the `Tag version` workflow tags the commit with the version in `Cargo.toml` (`vX.Y.Z`). To release, bump that version in a pull request. An existing tag is never moved.
+
+
 1. Describe the app's feed:
 
    ```rust
