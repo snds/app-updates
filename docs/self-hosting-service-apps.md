@@ -1,6 +1,6 @@
 # Self-hosting: one service app per product
 
-Status: **proposal, for Sean's OK** (2026-11-20). Nothing here is built yet.
+Status: **approved by Sean, 2026-11-20**, all five decisions as written. Being built (Part 2).
 
 Sean's rule (2026-11-20): anything self-hosted ships with one service app of its own. It runs the
 product's helper tooling and its updates. Each product updates itself, never another product.
@@ -40,7 +40,7 @@ engine's code and is tested, not left to configuration.
 | `artifacts` | **Separate, run and updated. CI starts publishing its image.** | Keeps its own hostname and network, with no route to the API. Today it is built on the server, so it can't be updated by digest. Once published, it becomes `server-artifacts` on the channel, and is optional (on only when its hostname exists). |
 | `db` (Postgres) | **Separate and run, never updated by the engine** | Keeps its own container and data. A major Postgres version needs a dump and a restore, so a new `db` image is always a by-hand update. |
 | `backup` | **Merges into the service app** | It is helper tooling: the nightly `pg_dump`, the backup before each update, and the list Settings shows. The service app runs the same `backup.sh` schedule against `db`, read-only, into the same `backups/` folder. |
-| app-updates `host-helper` (D12) | **Merges into the service app, then is archived** | Its role, a backup before, waiting for tasks, recreating the containers and the self-test after, becomes the engine plus Warpcore's steps. Its code moves to `archive/host-helper/`, not deleted. It isn't running on Sean's server today. |
+| app-updates `host-helper` (D12) | **Warpcore stops using it; its role merges into the service app** | Its role for Warpcore, a backup before, waiting for tasks, recreating the containers and the self-test after, becomes the engine plus Warpcore's steps. Warpcore's install of it (`deploy/host-helper/`) moves to an archive folder, not deleted. The crate itself stays in this repo, because the Lockdown server and the Vale gateway still use it until they get service apps of their own. It isn't running on Sean's server today. |
 | Synapse relay's update helper | **Its Warpcore role moves into the service app** | It stays in the relay, for Synapse only (section 4). It is switched off on Sean's server today (`SY_RELAY_UPDATES=0`). |
 | Gateway stack: LiteLLM, `provider-admin`, `ollama-repair`, `desktop-proxy` | **Stays outside, for now** | Its own compose project, keys and config, all changed by hand (`byHand`) today. The service app only checks it can reach `gateway:4000` and shows that in Settings. It could become a set of run and updated services later, as a separate step. |
 | `cloudflared` | **Stays outside** | One tunnel serves every app on the server (`Unraid-Cloudflared-Tunnel`), so it belongs to none of them. |
@@ -215,7 +215,7 @@ same ones.
    - New tests for the ahead-of-time download, auto against manual, the signed `byHand`, and the
      hooks.
    - The service-app shell: the API, settings, the 6-hour timer, status.
-   - `host-helper/` archived.
+   - `host-helper/` stays, for Lockdown and Vale; Warpcore's install of it is archived in snds/warpcore.
 2. **snds/warpcore:**
    - `apps/server` (`warpcore-server`): the hooks, adopt mode, setup on first start, the merged
      backups.
