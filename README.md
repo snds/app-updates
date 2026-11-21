@@ -24,6 +24,7 @@ proposal, approved 2026-11-08 (U1–U6).
 | The Tauri glue: the plugin, the background check, the commands, the menu item, install on quit, reload | `src/shell.rs` (`tauri` feature) | Yes |
 | The release workflow (stamp the version, sign, write `latest.json`, publish) | `.github/workflows/release-main.yml`, `release/` | — |
 | The restart helper for servers on a Docker host (one-click Update and Reload, U5), and the client the servers call it with | `host-helper/` (its own crate) | — |
+| The server update engine and the service-app shell: one service app per self-hosted product, which downloads each signed release ahead of time and installs it by hand or automatically ([the design](docs/self-hosting-service-apps.md)) | `server-engine/` (its own crate) | — |
 
 ## Using it in an app
 
@@ -59,6 +60,32 @@ New versions tag themselves: once CI passes on `main`, the `Tag version` workflo
    plugin from Rust.
 
 The page hears every change on the app's event (`"<app>://update"`) as an `UpdateStatus`.
+
+## Server update engine
+
+`server-engine/` is what every self-hosted product's **service app** runs
+([docs/self-hosting-service-apps.md](docs/self-hosting-service-apps.md)). Each product ships one
+service app of its own, and it updates only that product.
+
+- **Signed channel:** a Tauri-style `latest.json` with one `server-<service>` entry per image, each
+  signed over its `sy-server-release/1` statement. The release's own signature covers its by-hand
+  flag (`sy-server-release-meta/1`). `service-app statement` and `service-app meta-statement`
+  print the bytes CI signs.
+- **Ahead of time:** every 6 hours (and on **Check for updates**) a newer signed release's images
+  are pulled by digest, without touching what runs.
+- **The person's choice**, in the product's own Settings: **Restart to update** by hand, or
+  automatically in a time window or whenever nothing would be lost. A release that needs a step
+  by hand, or whose flag isn't signed, never installs by itself.
+- **Swap, health check, rollback:** each container is rebuilt from its own settings with only the
+  image changed. The old one is kept for **Roll back**, and any failure puts every service back.
+- **The product's steps:** what is running (wait for it), a backup before (shown with the update),
+  and a self-test after, in a one-off copy of a service (a failure rolls back).
+- **Docker** only through the service app's own socket proxy, and only containers labelled
+  `org.snds.update.app=<product>`. A registry sign-in is sent only with pulls from its own registry.
+
+Ported from Synapse's relay helper (`relay/src/updates/`, X15e, LS18) with Synapse #233's
+registry sign-in. A product builds `service-app` into its image with its config
+(`/etc/service-app/app.toml`) and its release key.
 
 ## Local channel
 
