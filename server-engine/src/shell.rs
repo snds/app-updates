@@ -488,9 +488,41 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// The token shared with the product: `SERVICE_APP_TOKEN`, or else `<data>/token`, made once (48
+/// random bytes as hex, mode 600) so nobody has to copy a secret between two places by hand. The
+/// product reads the same file, or is given the same value.
+pub fn token(data: &Path) -> Result<String, String> {
+    if let Some(t) = env("SERVICE_APP_TOKEN") {
+        return Ok(t);
+    }
+    let path = data.join("token");
+    if let Ok(t) = std::fs::read_to_string(&path)
+        && t.trim().len() >= TOKEN_MIN
+    {
+        return Ok(t.trim().to_owned());
+    }
+    let mut raw = [0u8; 48];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut raw))
+        .map_err(|e| format!("making the token: {e}"))?;
+    let t: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = path.with_extension("new");
+    std::fs::write(&tmp, &t).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    eprintln!("service-app: made its token in {}", path.display());
+    Ok(t)
+}
+
 /// Builds the service app from its config and the environment.
 pub fn build(cfg: &Config) -> Result<(Arc<Api>, Updater), String> {
-    let token = env("SERVICE_APP_TOKEN");
+    let data = PathBuf::from(env("SERVICE_APP_DATA").unwrap_or_else(|| "/data".into()));
+    let token = Some(token(&data)?);
     if token.as_ref().is_none_or(|t| t.trim().len() < TOKEN_MIN) {
         eprintln!(
             "service-app: SERVICE_APP_TOKEN is missing or shorter than {TOKEN_MIN} characters, so \
@@ -514,7 +546,6 @@ pub fn build(cfg: &Config) -> Result<(Arc<Api>, Updater), String> {
             );
         }
     }
-    let data = PathBuf::from(env("SERVICE_APP_DATA").unwrap_or_else(|| "/data".into()));
     let settings = Settings::new(cfg.feed()?);
     let updater = Updater::new(
         settings,
@@ -615,6 +646,28 @@ pub fn run(cfg: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_is_made_once_and_kept_private() {
+        let dir = tempfile::tempdir().unwrap();
+        // The environment wins when it's set; this test leaves it unset.
+        if std::env::var("SERVICE_APP_TOKEN").is_ok() {
+            return;
+        }
+        let t = token(dir.path()).unwrap();
+        assert_eq!(t.len(), 96);
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(token(dir.path()).unwrap(), t, "the same token every start");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("token"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[test]
     fn tokens_compare_whole() {
