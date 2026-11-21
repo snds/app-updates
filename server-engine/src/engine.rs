@@ -463,6 +463,17 @@ impl Updater {
         self.set(|st| st.downloaded = here);
     }
 
+    /// The newest signed release, checked in full (LS18), for a first install: the images the
+    /// product's setup starts from.
+    pub fn release_now(&self) -> Result<Release, String> {
+        self.latest()
+    }
+
+    /// Whether any of the product's services runs on this server.
+    pub fn installed(&self) -> Result<bool, String> {
+        Ok(!self.services()?.is_empty())
+    }
+
     /// The release on offer now, checked in full (LS18).
     fn latest(&self) -> Result<Release, String> {
         let feed = self.feed();

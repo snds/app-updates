@@ -156,3 +156,63 @@ fn a_short_or_missing_token_turns_every_change_off() {
         assert_eq!(call(&base, "POST", "/v1/check", Some(""), "").0, 401);
     }
 }
+
+#[test]
+fn a_first_install_runs_setup_with_the_signed_release_and_only_when_nothing_is_installed() {
+    let key = Key::new(7);
+    let channel = Channel::start();
+    let docker = FakeDocker::start();
+    channel.publish(signed_manifest(
+        &key,
+        APP,
+        "1.1.0",
+        false,
+        &[
+            ("web", &img("web", 'b')),
+            ("artifacts", &img("artifacts", 'b')),
+        ],
+    ));
+    let u = updater(settings(APP, &channel.url, &key.public()), &docker, NoHooks);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("env.txt");
+    let setup = server_engine::shell::Setup {
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            format!("env > '{}'", out.display()),
+        ],
+    };
+    assert!(server_engine::shell::setup_if_needed(&u, &setup).unwrap());
+    let env = std::fs::read_to_string(&out).unwrap();
+    assert!(env.contains("SETUP_VERSION=1.1.0"), "{env}");
+    assert!(env.contains(&format!("SETUP_IMAGE_WEB={}", img("web", 'b'))));
+    assert!(env.contains(&format!("SETUP_IMAGE_ARTIFACTS={}", img("artifacts", 'b'))));
+    assert!(
+        !env.contains("SERVICE_APP_TOKEN"),
+        "setup gets no token it wasn't given"
+    );
+
+    // Once a service is there, setup never runs again.
+    std::fs::remove_file(&out).unwrap();
+    docker.publish_image(&img("web", 'b'), "1.1.0", Behaves::Healthy);
+    docker.run("warpcore-web-1", APP, "web", &img("web", 'b'));
+    assert!(!server_engine::shell::setup_if_needed(&u, &setup).unwrap());
+    assert!(!out.exists());
+
+    // A release that isn't signed by the key is never set up from.
+    let docker2 = FakeDocker::start();
+    channel.publish(signed_manifest(
+        &Key::new(9),
+        APP,
+        "1.1.0",
+        false,
+        &[("web", &img("web", 'b'))],
+    ));
+    let u2 = updater(
+        settings(APP, &channel.url, &key.public()),
+        &docker2,
+        NoHooks,
+    );
+    assert!(server_engine::shell::setup_if_needed(&u2, &setup).is_err());
+    assert!(!out.exists());
+}

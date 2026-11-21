@@ -40,6 +40,29 @@ pub struct Config {
     pub docker: DockerConfig,
     #[serde(default)]
     pub hooks: HookConfig,
+    /// The product's helper tools the service app keeps running (Warpcore's nightly backup).
+    #[serde(default)]
+    pub tools: Vec<Tool>,
+    /// The product's first install: run once when none of its services is on this server yet.
+    #[serde(default)]
+    pub setup: Option<Setup>,
+}
+
+/// A helper tool: a fixed command, started with the service app and started again if it ends.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tool {
+    pub name: String,
+    pub command: Vec<String>,
+}
+
+/// The product's first install. The command gets the newest signed release's images, by digest,
+/// as `SETUP_VERSION` and `SETUP_IMAGE_<SERVICE>` (upper case, `-` as `_`), and brings up the
+/// product's containers from the setup built into the image.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setup {
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +153,14 @@ impl Config {
         }
         if !h.before_command.is_empty() && h.backups_dir.is_none() {
             return Err("hooks: before_command needs backups_dir, to name the backup".into());
+        }
+        for t in &self.tools {
+            if t.name.is_empty() || t.command.is_empty() {
+                return Err("tools: each needs a name and a command".into());
+            }
+        }
+        if self.setup.as_ref().is_some_and(|s| s.command.is_empty()) {
+            return Err("setup: needs a command".into());
         }
         Ok(())
     }
@@ -494,12 +525,87 @@ pub fn build(cfg: &Config) -> Result<(Arc<Api>, Updater), String> {
     Ok((Arc::new(Api::new(updater.clone(), token)), updater))
 }
 
-/// Runs the service app: the timer on its own thread, the API on this one.
-pub fn run(cfg: &Config) -> Result<(), String> {
-    let (api, updater) = build(cfg)?;
+/// Keeps `tool` running: starts it, and starts it again a minute after it ends.
+fn keep_running(tool: Tool) {
     std::thread::spawn(move || {
         loop {
+            let (cmd, args) = tool.command.split_first().expect("checked in validate");
+            match std::process::Command::new(cmd)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .status()
+            {
+                Ok(s) => eprintln!(
+                    "service-app: {} ended ({s}); starting it again in a minute",
+                    tool.name
+                ),
+                Err(e) => eprintln!(
+                    "service-app: {} couldn't start: {e}; trying again in a minute",
+                    tool.name
+                ),
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    });
+}
+
+/// The environment a first install runs with: the newest signed release's version and images.
+pub fn setup_env(rel: &crate::release::Release) -> Vec<(String, String)> {
+    let mut env = vec![("SETUP_VERSION".to_owned(), rel.version.to_string())];
+    for (svc, image) in &rel.images {
+        env.push((
+            format!("SETUP_IMAGE_{}", svc.to_ascii_uppercase().replace('-', "_")),
+            image.clone(),
+        ));
+    }
+    env
+}
+
+/// Runs the product's first install when none of its services is here yet. Returns whether it ran.
+pub fn setup_if_needed(updater: &Updater, setup: &Setup) -> Result<bool, String> {
+    if updater.installed()? {
+        return Ok(false);
+    }
+    let rel = updater.release_now()?;
+    let (cmd, args) = setup
+        .command
+        .split_first()
+        .ok_or("setup: needs a command")?;
+    eprintln!(
+        "service-app: nothing installed yet; setting up {}",
+        rel.version
+    );
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .envs(setup_env(&rel))
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("setup: {e}"))?;
+    if out.success() {
+        Ok(true)
+    } else {
+        Err(format!("setup ended with {out}"))
+    }
+}
+
+/// Runs the service app: its tools, the first install if needed, the timer, and the API.
+pub fn run(cfg: &Config) -> Result<(), String> {
+    let (api, updater) = build(cfg)?;
+    for t in &cfg.tools {
+        keep_running(t.clone());
+    }
+    let setup = cfg.setup.clone();
+    std::thread::spawn(move || {
+        let mut minutes = 0u32;
+        loop {
+            if let Some(s) = &setup
+                && minutes.is_multiple_of(10)
+                && let Err(e) = setup_if_needed(&updater, s)
+            {
+                eprintln!("service-app: {e}");
+            }
             updater.tick();
+            minutes = minutes.wrapping_add(1);
             std::thread::sleep(Duration::from_secs(60));
         }
     });
@@ -547,6 +653,20 @@ after_command = ["node", "dist/selftest.js"]
         assert_eq!(c.listen.addr, "0.0.0.0:7490");
         assert_eq!(c.docker.registry, "ghcr.io");
         assert_eq!(c.app.optional, vec!["artifacts"]);
+        let with = format!(
+            "{good}\n[[tools]]\nname = \"backup\"\ncommand = [\"sh\", \"/backup/backup.sh\"]\n\n[setup]\ncommand = [\"sh\", \"/etc/service-app/setup.sh\"]\n"
+        );
+        std::fs::write(&path, &with).unwrap();
+        let c = Config::read(&path).unwrap();
+        assert_eq!(c.tools[0].name, "backup");
+        assert_eq!(c.setup.unwrap().command[1], "/etc/service-app/setup.sh");
+        for bad in [
+            format!("{good}\n[[tools]]\nname = \"backup\"\ncommand = []\n"),
+            format!("{good}\n[setup]\ncommand = []\n"),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Config::read(&path).is_err());
+        }
         for bad in [
             good.replace("after_service = \"sandbox\"\n", ""),
             good.replace("backups_dir = \"/backups\"\n", ""),
