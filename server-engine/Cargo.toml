@@ -1,0 +1,41 @@
+[package]
+name = "snds-server-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "The shared server update engine for snds service apps: a signed channel, images pulled by digest ahead of time, swap, health check and rollback, an automatic or by-hand choice, and the product's own steps around an update. Also the service-app shell that runs it."
+repository = "https://github.com/snds/app-updates"
+publish = false
+
+[lib]
+name = "server_engine"
+
+[[bin]]
+name = "service-app"
+path = "src/main.rs"
+required-features = ["shell"]
+
+[features]
+# The service-app shell: its HTTP API, settings file, timer and the product's steps read from a
+# config file. A product that embeds only the engine turns it off.
+default = ["shell"]
+shell = ["dep:tiny_http", "dep:toml"]
+
+[dependencies]
+base64 = "0.22.1"
+minisign-verify = "0.3.0"
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+# The server's own time zone, for an update window, with the zone data built in so a slim image
+# needs none.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
+tiny_http = { version = "0.12.0", optional = true }
+toml = { version = "0.9", optional = true }
+
+[dev-dependencies]
+ed25519-dalek = "2.2.0"
+tempfile = "3.27.0"
+tiny_http = "0.12.0"
